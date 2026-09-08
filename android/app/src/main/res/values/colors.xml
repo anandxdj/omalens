@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="omacam_surface">#111318</color>
+    <color name="omacam_text">#F2F4F8</color>
+    <color name="omacam_muted">#AEB6C2</color>
+    <color name="omacam_accent">#78DCE8</color>
+</resources>

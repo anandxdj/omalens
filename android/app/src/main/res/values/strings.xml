@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">OmaCam</string>
+    <string name="pair_title">Pair your phone</string>
+    <string name="pair_intro">Scan the QR shown by OmaCam on your laptop. Scanning does not start the camera.</string>
+    <string name="scan_qr">Scan desktop QR</string>
+    <string name="approve_pairing">Approve pairing</string>
+    <string name="cancel">Cancel</string>
+    <string name="scan_cancelled">QR scan cancelled.</string>
+    <string name="waiting_desktop">Code matched locally. Waiting for approval on the laptop…</string>
+    <string name="paired_success">Paired. Camera access has not started.</string>
+    <string name="confirm_code">Confirm this code on both devices:\n\n%1$s\n\nPairing does not start the camera.</string>
+    <string name="paired_with">Paired with %1$s</string>
+</resources>
