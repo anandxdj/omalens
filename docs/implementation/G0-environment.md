@@ -23,7 +23,7 @@ Status: in progress. Inspected 2026-09-08 with read-only commands unless noted.
 - The inspected Omarchy shell supports manifest schema 1 and on-demand bar-widget plugins. The plugin installer cannot install privileged dependencies.
 - GStreamer 1.28.6 output and WebRTC plugins were installed during implementation. `v4l2sink` and `webrtcbin` now probe successfully.
 - `v4l2loopback-dkms` 0.15.4-2 is installed for the matching kernel. Before the spike, no loopback module or sandbox-visible `/dev/video*` device was observed.
-- Android platform tools 37.0.0-3 were installed during implementation; Gradle and the Android SDK are absent. Java 26.0.2.1 is installed.
+- Android platform tools 37.0.0-3 and JDK 17.0.20.1 were installed during implementation. Java 26 remains the system default. A checksum-verified Android command-line SDK, Android 36 platform/build tools, and Gradle wrapper toolchain are currently staged under `/tmp` for the companion trial; they are not a durable system installation.
 - Secure Boot state could not be read because `mokutil` is absent. Treat it as unknown.
 - Read-only USB enumeration outside the sandbox identified an OPPO/OnePlus Nord 4 (`22d9:276a`). `adb devices -l` returned no authorized devices, so its OS/build/camera capabilities are still unknown. OmaCam did not enable debugging or change its USB mode.
 - The user session D-Bus could not be queried from the sandbox, so PipeWire service state remains unverified even though packages and the GStreamer PipeWire plugin are present.
@@ -33,6 +33,7 @@ Status: in progress. Inspected 2026-09-08 with read-only commands unless noted.
 - Dependency-free Rust session-policy crate with independent trust, connection, capture, and output states.
 - Explicit consent, session generation invalidation, ten-second capture lease, and 500 ms stale-frame neutralization rules.
 - Read-only host diagnostics command.
+- Secure QR-pairing core and companion build. The Android debug APK compiles and passes lint, but no phone was available to ADB for the physical ceremony test.
 - Synthetic neutral-output worker that requires an explicit existing `/dev/videoN` character device and uses an argument-array GStreamer process. It does not provision or select a device.
 - A temporary, non-persistent `/dev/video42` labeled `OmaCam Camera` was created with `exclusive_caps=1`. The worker negotiated YUYV 1280×720 at 30 fps. `v4l2-ctl` consumed three frames totaling 5,529,600 bytes, exactly three 1,843,200-byte frames. This proves the producer/consumer format path on this host; Chrome, Firefox, OBS, persistence, ownership, and idle-resource claims remain untested.
 - Diagnostics distinguished the running writer (`READY`) from the stopped writer (`INACTIVE`). The temporary writer was stopped, the test module/device was removed, and the raw `/tmp` capture was deleted after verification. Installed packages remain as development prerequisites.

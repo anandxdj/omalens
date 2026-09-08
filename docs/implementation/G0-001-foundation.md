@@ -31,7 +31,7 @@ No network, USB configuration, ADB authorization, firewall, VPN, desktop configu
 
 - The QML artifact is linted but has not been loaded into the live shell.
 - Chrome, Firefox, OBS, sandboxed/portal consumers, stable ownership/provisioning, crash persistence, and resource budgets remain untested.
-- A OnePlus Nord 4 was observed on USB but is not ADB-authorized. No Android SDK, Camera2 capture, authenticated media, pairing, or preview path exists yet.
+- A OnePlus Nord 4 was observed on USB but is not currently visible to ADB. The temporary Android SDK/toolchain and QR-pairing implementation now exist; the real-device ceremony, Camera2 capture, authenticated media, and preview path remain unverified or unimplemented as described in the later implementation records.
 - Public naming, license, repository URL, Android application ID/signing, and final service identifiers remain open.
 
 Next task: G0-002 should prove the read-only panel in the actual Omarchy shell and select a bounded preview mechanism. G0-003 should establish an Android test device/toolchain and evaluate one maintained authenticated media path before G1 contracts are frozen.
