@@ -1,0 +1,38 @@
+# Review of the original plan
+
+The vision is coherent: a simple phone-to-webcam experience with unusually strong coexistence requirements. Separating the shell from the media engine, exposing actual camera capabilities, and avoiding a cloud media dependency are good foundations. The plan is not yet architecture-ready: it combines a mature multi-backend product with unresolved platform, security, and installation assumptions.
+
+Severity below means the impact of leaving the issue unresolved, not that the product is impossible.
+
+## Findings and corrections
+
+| ID | Severity / original sections | Flaw or gap | Proposed correction |
+| --- | --- | --- | --- |
+| F01 | Blocker / 4, 34, 38 | Shell plugin installation is treated as a system installer. Omarchy's documented plugin installer does not execute install hooks or sudo. | Distribute the desktop plugin and system package separately, with a guided prerequisites check. Validate a supported GUI package workflow before promising terminal-free setup. [S1](09-decisions-and-sources.md#s1-omarchy-shell) |
+| F02 | Blocker / 6–9, 18 | A QR pointing to a LAN HTTP page does not solve browser camera access, HTTPS trust, or secure signaling bootstrap. | Use a native scanner in the proposed MVP. Gate browser support on a complete secure-context and certificate design; never ask users to disable browser security. [S3](09-decisions-and-sources.md#s3-browser-capture) |
+| F03 | High / 8, 15–17, 44–46 | Four providers, wired/wireless handover, audio, and advanced controls multiply the first-release failure matrix. | Deliver native companion over an existing local IP network first. Add one provider at a time against a shared conformance suite. Keep the full vision as later milestones. |
+| F04 | High / 9, 12–14, 45 | Camera IDs and separate lists of resolutions/FPS do not describe valid capture configurations. Logical cameras may not expose independently usable physical lenses. | Represent tested mode tuples and per-camera control constraints. Treat physical IDs as metadata until opening the requested session succeeds. Do not promise every lens. [S4](09-decisions-and-sources.md#s4-android-cameras) |
+| F05 | High / 7, 11, 32, 42 | Auto-connect is ambiguous about starting capture. A wake lock does not grant camera access or bypass background-start restrictions. | Separate peer authentication from capture consent. Start capture through a visible phone flow; reconnect only within the same explicitly armed session. Black-screen mode is an in-app dim UI. [S5](09-decisions-and-sources.md#s5-android-lifecycle) |
+| F06 | High / 3, 25, 30 | A persistent kernel node is confused with a continuously discoverable, usable webcam. `exclusive_caps` changes advertised capabilities when a producer attaches. | Keep a dedicated output writer feeding safe frames throughout a ready service session. Distinguish transport failure from writer, daemon, kernel, and reboot failures. [S2](09-decisions-and-sources.md#s2-v4l2loopback) |
+| F07 | High / 19–20, 46 | Switching provider may require releasing the camera; safe networking does not imply seamless camera handover. | Defer opportunistic handover. Later preserve output format, use bounded switching with rollback, and allow a neutral-frame gap. Never assume simultaneous camera ownership. |
+| F08 | High / 3, 17, 47 | Composite USB examples are not proof of coexistence on an arbitrary phone. ADB also requires a separate, powerful developer authorization. | Never enable debugging or change USB functions automatically. Treat unknown disruption risk as disqualifying; test each supported phone/USB combination. |
+| F09 | High / 17, 28, 41 | The scrcpy camera path has an audio default that can conflict with microphone opt-in. | Explicitly disable audio before launching any future scrcpy backend; verify no microphone capture occurs. Camera mirroring also has its own Android version floor. [S6](09-decisions-and-sources.md#s6-scrcpy) |
+| F10 | High / 26, 56 | V4L2 and PipeWire are shown as if they automatically merge into one camera. Portal support is not established by node properties alone. | Make V4L2 the first output, test the actual portal path, and avoid separately publishing a duplicate camera source. [S7](09-decisions-and-sources.md#s7-camera-portal) |
+| F11 | High / 6–7, 43 | Security adjectives omit bootstrap authentication, key possession, transcript binding, revocation, rate limits, and session expiry. | Define a pairing ceremony and attack tests; select a maintained security implementation before protocol coding. See the security document. |
+| F12 | High / 34 | Keeping decoders out of the shell protects against decoder crashes, but QML code still executes within the shell. | Bound UI work and preview buffers, avoid native media plugins in the shell, and test shell stability. Do not claim total crash isolation for in-process plugin bugs. |
+| F13 | Medium / 21–23, 33 | Latency labels lack a measurement definition; RTT is not camera-to-application latency. “Reasonable CPU” is not testable. | Label RTT explicitly, define glass-to-glass measurements, and propose resource and recovery budgets. Record hardware and percentiles. |
+| F14 | Medium / 28 | “Laptop/default microphone” and “No audio” imply control over the call application's microphone. | Say “Phone microphone: Off” for video-only operation. Explain that the meeting app chooses its microphone. Never change the system default source. |
+| F15 | High / 38–40, 50–51 | Kernel upgrades, Secure Boot, shared module ownership, rollback, and repair privileges are unspecified. | Add package ownership records, kernel compatibility checks, scoped repair plans, and recovery tests. Never unload a shared module or weaken host security to repair OmaCam. |
+| F16 | Medium / 18, 31, 48 | mDNS and QR discovery are treated as connectivity guarantees. Client isolation, firewalls, VPN routes, and hotspot behavior vary. | QR may offer explicit current endpoints; discovery is only a hint. Diagnose unreachable paths without changing networking. Support claims require tests. |
+| F17 | High / 30, 42 | Keeping the last frame can expose private imagery after disconnect, lock, or revocation. | Replace it with neutral frames, drain stale queues, and revoke the capture session on explicit stop and desktop lock. |
+| F18 | Medium / throughout | The original citation markers cannot be followed outside the originating chat; branch/version assumptions are unstated. | Preserve the original but use real primary-source links and pin tested platform versions before release. |
+
+## Product tradeoffs to make explicit
+
+The proposed MVP asks users to install an Android companion. That delays the original zero-install ambition but provides one controllable capture and consent path. It is a release sequencing recommendation, not evidence that a browser client cannot be built.
+
+“Does not interfere” should mean **OmaCam does not reconfigure or intentionally disrupt other services**, with tests for continuity. Video still consumes bandwidth, CPU, battery, and heat; no design can promise zero physical resource contention. Quality adaptation must yield resources when needed.
+
+“One camera” means one OmaCam-owned virtual camera and one active phone. Existing physical and third-party virtual cameras remain visible. A future UVC phone may also remain visible under its native name; OmaCam must not hide other devices to satisfy its label promise.
+
+“Stable camera” is a scoped service guarantee, not permanence across reboot, kernel removal, or arbitrary process failure. Claims must follow the tested failure envelope in the PRD.
