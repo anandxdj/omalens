@@ -1,0 +1,13 @@
+[package]
+name = "omacam-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+omacam-core = { path = "../omacam-core" }
+
+[lints]
+workspace = true
+
