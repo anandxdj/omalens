@@ -58,9 +58,39 @@ internal data class PreparedClaim(
         .toString()
 }
 
+internal data class ControlHello(
+    val version: Int,
+    val features: Long,
+    val sessionId: String,
+    val challenge: String,
+    val certificateSha256: String,
+)
+
+internal data class PreparedControlProof(
+    val version: Int,
+    val features: Long,
+    val sessionId: String,
+    val phonePublicKeySha256: ByteArray,
+    val phoneNonce: ByteArray,
+    val signatureDer: ByteArray,
+) {
+    fun toJson(): String = JSONObject()
+        .put("type", "control_proof")
+        .put("v", version)
+        .put("features", features)
+        .put("sid", sessionId)
+        .put("key", phonePublicKeySha256.base64Url())
+        .put("nonce", phoneNonce.base64Url())
+        .put("sig", signatureDer.base64Url())
+        .toString()
+}
+
 internal object PairingProtocol {
     private val exactInvitationKeys = setOf(
         "v", "sid", "token", "challenge", "cert", "endpoint", "name", "expires",
+    )
+    private val exactControlHelloKeys = setOf(
+        "type", "min_v", "max_v", "features", "required", "sid", "challenge", "cert",
     )
 
     fun parseInvitation(raw: String, nowUnixSeconds: Long): Invitation {
@@ -129,6 +159,54 @@ internal object PairingProtocol {
         )
     }
 
+    fun parseControlHello(raw: String, expectedCertificateSha256: String): ControlHello {
+        require(raw.toByteArray(StandardCharsets.UTF_8).size <= MAX_CONTROL_BYTES) {
+            "Desktop control message is too large"
+        }
+        val json = JSONObject(raw)
+        require(json.keys().asSequence().toSet() == exactControlHelloKeys) {
+            "Desktop control fields are not recognized"
+        }
+        require(json.getString("type") == "control_hello") { "Unexpected desktop message" }
+        val minimumVersion = json.getInt("min_v")
+        val maximumVersion = json.getInt("max_v")
+        require(1 in minimumVersion..maximumVersion) { "Desktop control version is incompatible" }
+        val features = json.getLong("features")
+        val requiredFeatures = json.getLong("required")
+        require(features >= 0 && requiredFeatures >= 0 && requiredFeatures and features == requiredFeatures) {
+            "Desktop requires unsupported control features"
+        }
+        require(requiredFeatures == 0L) { "Desktop requires unsupported control features" }
+        val sessionId = json.getString("sid").also { it.decodeExact(16) }
+        val challenge = json.getString("challenge").also { it.decodeExact(32) }
+        val certificate = json.getString("cert").also { it.decodeExact(32) }
+        require(
+            MessageDigest.isEqual(
+                certificate.decodeBase64Url(),
+                expectedCertificateSha256.decodeBase64Url(),
+            ),
+        ) { "Desktop identity changed" }
+        return ControlHello(1, 0, sessionId, challenge, certificate)
+    }
+
+    fun prepareControlProof(hello: ControlHello): PreparedControlProof {
+        val keyPair = loadOrCreateIdentity()
+        val phoneKeyDigest = MessageDigest.getInstance("SHA-256").digest(keyPair.public.encoded)
+        val nonce = ByteArray(32).also(SecureRandom()::nextBytes)
+        val transcript = controlProofTranscript(hello, phoneKeyDigest, nonce)
+        val signer = Signature.getInstance("SHA256withECDSA")
+        signer.initSign(keyPair.private)
+        signer.update(transcript)
+        return PreparedControlProof(
+            hello.version,
+            hello.features,
+            hello.sessionId,
+            phoneKeyDigest,
+            nonce,
+            signer.sign(),
+        )
+    }
+
     // The self-signed leaf is an ephemeral channel certificate authenticated by
     // its exact SHA-256 digest in the physically scanned invitation. Normal CA
     // validation cannot establish that local, non-DNS identity.
@@ -187,6 +265,23 @@ internal object PairingProtocol {
         appendField(output, invitation.desktopName.toByteArray(StandardCharsets.UTF_8))
         appendField(output, phoneName.toByteArray(StandardCharsets.UTF_8))
         appendField(output, publicKeyDer)
+        appendField(output, phoneNonce)
+        return output.toByteArray()
+    }
+
+    private fun controlProofTranscript(
+        hello: ControlHello,
+        phoneKeyDigest: ByteArray,
+        phoneNonce: ByteArray,
+    ): ByteArray {
+        val output = ByteArrayOutputStream()
+        output.write("OMACAM-CONTROL-PROOF-V1\u0000".toByteArray(StandardCharsets.UTF_8))
+        appendField(output, byteArrayOf(hello.version.toByte()))
+        appendField(output, ByteBuffer.allocate(4).putInt(hello.features.toInt()).array())
+        appendField(output, hello.sessionId.toByteArray(StandardCharsets.UTF_8))
+        appendField(output, hello.challenge.toByteArray(StandardCharsets.UTF_8))
+        appendField(output, hello.certificateSha256.toByteArray(StandardCharsets.UTF_8))
+        appendField(output, phoneKeyDigest)
         appendField(output, phoneNonce)
         return output.toByteArray()
     }

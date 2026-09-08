@@ -1,5 +1,9 @@
 package dev.omacam.companion
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
 import android.os.Bundle
 import android.view.Gravity
 import android.view.View
@@ -7,7 +11,9 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.edit
+import androidx.core.content.ContextCompat
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
@@ -24,23 +30,53 @@ import javax.net.ssl.SSLSocket
 
 class MainActivity : AppCompatActivity() {
     private val worker = Executors.newSingleThreadExecutor()
+    private val controlSender = Executors.newSingleThreadExecutor()
     private lateinit var title: TextView
     private lateinit var details: TextView
     private lateinit var primary: Button
     private lateinit var secondary: Button
     @Volatile private var activeSocket: Socket? = null
+    @Volatile private var activeControlOutput: BufferedOutputStream? = null
+    @Volatile private var cameraStreamer: CameraStreamer? = null
+    @Volatile private var resolvingService = false
     private var pendingClaim: PreparedClaim? = null
+    private var pendingStart: ControlResponse.StartRequest? = null
+    private var activeTrustedDesktop: TrustedDesktop? = null
+    private var activeEndpoint: Endpoint? = null
+    private var discoveryListener: NsdManager.DiscoveryListener? = null
+    private val cameraPermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        val request = pendingStart ?: return@registerForActivityResult
+        if (granted) approveStart(request) else rejectStart(request, getString(R.string.camera_denied))
+    }
+
+    private data class TrustedDesktop(val name: String, val certificateSha256: String)
+    private data class ControlConnection(
+        val socket: SSLSocket,
+        val input: BufferedInputStream,
+        val output: BufferedOutputStream,
+    )
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         buildUi()
-        showReady()
+        loadTrustedDesktop()?.let(::showTrusted) ?: showReady()
     }
 
     override fun onDestroy() {
+        stopDiscovery()
+        stopCapture("App closed")
+        sendControlCommand("disconnect")
         activeSocket?.close()
         worker.shutdownNow()
+        controlSender.shutdownNow()
         super.onDestroy()
+    }
+
+    override fun onPause() {
+        if (cameraStreamer != null) stopCapture("OmaCam left the foreground")
+        super.onPause()
     }
 
     private fun buildUi() {
@@ -75,9 +111,54 @@ class MainActivity : AppCompatActivity() {
         title.setText(R.string.pair_title)
         details.text = message ?: getString(R.string.pair_intro)
         primary.setText(R.string.scan_qr)
+        primary.visibility = View.VISIBLE
         primary.isEnabled = true
         primary.setOnClickListener { scanQr() }
         secondary.visibility = View.GONE
+        secondary.isEnabled = true
+    }
+
+    private fun loadTrustedDesktop(): TrustedDesktop? {
+        val preferences = getSharedPreferences("trusted_desktop", MODE_PRIVATE)
+        val name = preferences.getString("name", null) ?: return null
+        val certificate = preferences.getString("certificate_sha256", null) ?: return null
+        return try {
+            certificate.decodeBase64Url().also { require(it.size == 32) }
+            TrustedDesktop(name, certificate)
+        } catch (_: Exception) {
+            preferences.edit { clear() }
+            null
+        }
+    }
+
+    private fun showTrusted(trusted: TrustedDesktop, message: String? = null) {
+        pendingClaim = null
+        pendingStart = null
+        title.text = getString(R.string.paired_with, trusted.name)
+        details.text = message ?: getString(R.string.ready_to_reconnect)
+        primary.visibility = View.VISIBLE
+        primary.isEnabled = true
+        primary.setText(R.string.find_desktop)
+        primary.setOnClickListener { discoverTrustedDesktop(trusted) }
+        secondary.visibility = View.VISIBLE
+        secondary.isEnabled = true
+        secondary.setText(R.string.forget_desktop)
+        secondary.setOnClickListener { forgetDesktop() }
+    }
+
+    private fun forgetDesktop() {
+        stopDiscovery()
+        stopCapture("Laptop forgotten")
+        getSharedPreferences("trusted_desktop", MODE_PRIVATE).edit { clear() }
+        primary.isEnabled = false
+        secondary.isEnabled = false
+        controlSender.execute {
+            sendControlCommand("forget_peer")
+            activeSocket?.close()
+            runOnUiThread {
+                if (!isDestroyed) showReady(getString(R.string.desktop_forgotten))
+            }
+        }
     }
 
     private fun scanQr() {
@@ -128,10 +209,13 @@ class MainActivity : AppCompatActivity() {
                     putLong("paired_at", Instant.now().epochSecond)
                 }
                 runOnUiThread {
-                    title.text = getString(R.string.paired_with, claim.invitation.desktopName)
-                    details.setText(R.string.paired_success)
-                    primary.visibility = View.GONE
-                    secondary.visibility = View.GONE
+                    showTrusted(
+                        TrustedDesktop(
+                            claim.invitation.desktopName,
+                            claim.invitation.certificateSha256,
+                        ),
+                        getString(R.string.paired_success),
+                    )
                 }
             } catch (error: Exception) {
                 runOnUiThread {
@@ -141,6 +225,287 @@ class MainActivity : AppCompatActivity() {
             } finally {
                 activeSocket = null
             }
+        }
+    }
+
+    private fun discoverTrustedDesktop(trusted: TrustedDesktop) {
+        stopDiscovery()
+        resolvingService = false
+        details.setText(R.string.searching_desktop)
+        primary.isEnabled = false
+        val manager = getSystemService(NsdManager::class.java)
+        val listener = object : NsdManager.DiscoveryListener {
+            override fun onDiscoveryStarted(serviceType: String) = Unit
+
+            override fun onServiceFound(serviceInfo: NsdServiceInfo) {
+                if (resolvingService) return
+                resolvingService = true
+                @Suppress("DEPRECATION")
+                manager.resolveService(
+                    serviceInfo,
+                    object : NsdManager.ResolveListener {
+                        override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                            resolvingService = false
+                        }
+
+                        override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
+                            val advertisedCertificate = serviceInfo.attributes["cert"]
+                                ?.toString(StandardCharsets.UTF_8)
+                            if (advertisedCertificate != trusted.certificateSha256) {
+                                resolvingService = false
+                                return
+                            }
+                            val address = serviceInfo.host?.hostAddress
+                            if (address == null || serviceInfo.port !in 1..65535) {
+                                resolvingService = false
+                                return
+                            }
+                            stopDiscovery()
+                            authenticateControl(trusted, Endpoint(address, serviceInfo.port))
+                        }
+                    },
+                )
+            }
+
+            override fun onServiceLost(serviceInfo: NsdServiceInfo) = Unit
+
+            override fun onDiscoveryStopped(serviceType: String) = Unit
+
+            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
+                stopDiscovery()
+                runOnUiThread {
+                    showTrusted(trusted, getString(R.string.discovery_failed, errorCode))
+                }
+            }
+
+            override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) = Unit
+        }
+        discoveryListener = listener
+        try {
+            manager.discoverServices("_omacam._tcp.", NsdManager.PROTOCOL_DNS_SD, listener)
+        } catch (error: Exception) {
+            discoveryListener = null
+            showTrusted(trusted, "Discovery failed: ${error.message}")
+        }
+    }
+
+    private fun stopDiscovery() {
+        val listener = discoveryListener ?: return
+        discoveryListener = null
+        resolvingService = false
+        try {
+            getSystemService(NsdManager::class.java).stopServiceDiscovery(listener)
+        } catch (_: IllegalArgumentException) {
+            // Discovery was already stopped by Android.
+        }
+    }
+
+    private fun authenticateControl(trusted: TrustedDesktop, endpoint: Endpoint) {
+        details.setText(R.string.authenticating_desktop)
+        worker.execute {
+            try {
+                val connection = authenticateControlOverTls(trusted, endpoint)
+                activeControlOutput = connection.output
+                activeTrustedDesktop = trusted
+                activeEndpoint = endpoint
+                runOnUiThread {
+                    showConnected(trusted, getString(R.string.control_connected))
+                }
+                maintainControlConnection(connection)
+            } catch (error: Exception) {
+                runOnUiThread {
+                    if (!isDestroyed) {
+                        loadTrustedDesktop()?.let {
+                            showTrusted(it, "Connection ended: ${error.message}")
+                        } ?: showReady(getString(R.string.desktop_forgotten))
+                    }
+                }
+            } finally {
+                stopCapture("Authenticated control ended")
+                activeControlOutput = null
+                activeTrustedDesktop = null
+                activeEndpoint = null
+                activeSocket?.close()
+                activeSocket = null
+            }
+        }
+    }
+
+    private fun authenticateControlOverTls(
+        trusted: TrustedDesktop,
+        endpoint: Endpoint,
+    ): ControlConnection {
+        val trustManager = PairingProtocol.pinningTrustManager(
+            trusted.certificateSha256.decodeBase64Url(),
+        )
+        val context = SSLContext.getInstance("TLSv1.3").apply {
+            init(null, arrayOf(trustManager), null)
+        }
+        val plainSocket = Socket()
+        activeSocket = plainSocket
+        plainSocket.connect(InetSocketAddress(endpoint.host, endpoint.port), 5_000)
+        plainSocket.soTimeout = 10_000
+        val socket = context.socketFactory.createSocket(
+            plainSocket,
+            endpoint.host,
+            endpoint.port,
+            true,
+        ) as SSLSocket
+        activeSocket = socket
+        socket.enabledProtocols = arrayOf("TLSv1.3")
+        socket.startHandshake()
+        val input = BufferedInputStream(socket.inputStream)
+        val hello = PairingProtocol.parseControlHello(
+            readBoundedLine(input),
+            trusted.certificateSha256,
+        )
+        val proof = PairingProtocol.prepareControlProof(hello)
+        val output = BufferedOutputStream(socket.outputStream)
+        output.write(proof.toJson().toByteArray(StandardCharsets.UTF_8))
+        output.write('\n'.code)
+        output.flush()
+        val result = JSONObject(readBoundedLine(input))
+        require(result.keys().asSequence().toSet() == setOf("type", "version", "capture_authorized")) {
+            "Desktop response fields are not recognized"
+        }
+        require(result.getString("type") == "authenticated") { "Desktop rejected identity" }
+        require(result.getInt("version") == 1) { "Desktop selected an incompatible version" }
+        require(!result.getBoolean("capture_authorized")) {
+            "Desktop attempted to start capture during reconnect"
+        }
+        return ControlConnection(socket, input, output)
+    }
+
+    private fun maintainControlConnection(connection: ControlConnection) {
+        while (!Thread.currentThread().isInterrupted && !connection.socket.isClosed) {
+            Thread.sleep(2_000)
+            synchronized(connection.output) {
+                connection.output.write("{\"type\":\"ping\"}\n".toByteArray(StandardCharsets.UTF_8))
+                connection.output.flush()
+            }
+            handleControlResponse(ControlProtocol.parseResponse(readBoundedLine(connection.input)))
+        }
+    }
+
+    private fun handleControlResponse(response: ControlResponse) {
+        when (response) {
+            is ControlResponse.Pong -> {
+                val streamer = cameraStreamer
+                if (response.captureAuthorized && streamer != null) {
+                    streamer.refreshLease()
+                } else if (response.captureAuthorized || streamer != null) {
+                    stopCapture("Capture authorization state changed unexpectedly")
+                    error("Desktop capture state does not match the phone")
+                }
+            }
+            is ControlResponse.StartRequest -> runOnUiThread { showStartRequest(response) }
+            is ControlResponse.CaptureGranted -> startCapture(response.binding)
+            is ControlResponse.Stopped -> {
+                stopCapture(response.reason)
+                activeTrustedDesktop?.let { trusted ->
+                    runOnUiThread { showConnected(trusted, getString(R.string.capture_ended, response.reason)) }
+                }
+            }
+            is ControlResponse.StopCapture -> stopCapture(response.reason)
+            ControlResponse.Forgotten -> Unit
+        }
+    }
+
+    private fun showStartRequest(request: ControlResponse.StartRequest) {
+        require(cameraStreamer == null && pendingStart == null) { "Another capture request is active" }
+        pendingStart = request
+        title.text = getString(R.string.share_camera_title, request.desktopName)
+        details.setText(R.string.share_camera_details)
+        primary.visibility = View.VISIBLE
+        primary.isEnabled = true
+        primary.setText(R.string.share_camera)
+        primary.setOnClickListener {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+                PackageManager.PERMISSION_GRANTED
+            ) {
+                approveStart(request)
+            } else {
+                cameraPermission.launch(Manifest.permission.CAMERA)
+            }
+        }
+        secondary.visibility = View.VISIBLE
+        secondary.isEnabled = true
+        secondary.setText(R.string.decline)
+        secondary.setOnClickListener { rejectStart(request, getString(R.string.capture_declined)) }
+    }
+
+    private fun approveStart(request: ControlResponse.StartRequest) {
+        require(pendingStart == request) { "Capture request is no longer pending" }
+        pendingStart = null
+        primary.isEnabled = false
+        secondary.isEnabled = false
+        details.setText(R.string.starting_camera)
+        sendControlCommand("start_approved", request.requestId)
+    }
+
+    private fun rejectStart(request: ControlResponse.StartRequest, message: String) {
+        if (pendingStart != request) return
+        pendingStart = null
+        sendControlCommand("start_rejected", request.requestId)
+        val trusted = activeTrustedDesktop ?: return
+        showTrusted(trusted, message)
+    }
+
+    private fun startCapture(binding: CaptureBinding) {
+        require(cameraStreamer == null) { "A capture pipeline is already active" }
+        val trusted = activeTrustedDesktop ?: error("Trusted desktop context is unavailable")
+        val endpoint = activeEndpoint ?: error("Desktop endpoint is unavailable")
+        lateinit var streamer: CameraStreamer
+        streamer = CameraStreamer(this, trusted.certificateSha256, endpoint, binding) { reason ->
+            if (cameraStreamer === streamer) cameraStreamer = null
+            runOnUiThread {
+                if (!isDestroyed) showConnected(trusted, getString(R.string.capture_ended, reason))
+            }
+        }
+        cameraStreamer = streamer
+        runOnUiThread {
+            title.text = getString(R.string.sharing_with, trusted.name)
+            details.setText(R.string.camera_live)
+            primary.visibility = View.VISIBLE
+            primary.isEnabled = true
+            primary.setText(R.string.stop_camera)
+            primary.setOnClickListener { stopCapture("Stopped on phone") }
+            secondary.visibility = View.GONE
+        }
+        streamer.start()
+    }
+
+    private fun stopCapture(reason: String) {
+        val streamer = cameraStreamer ?: return
+        cameraStreamer = null
+        streamer.stop(reason)
+        sendControlCommand("stop")
+        val trusted = activeTrustedDesktop
+        runOnUiThread {
+            if (!isDestroyed && trusted != null) showConnected(trusted, getString(R.string.capture_ended, reason))
+        }
+    }
+
+    private fun showConnected(trusted: TrustedDesktop, message: String) {
+        title.text = getString(R.string.connected_to, trusted.name)
+        details.text = message
+        primary.visibility = View.GONE
+        secondary.visibility = View.VISIBLE
+        secondary.isEnabled = true
+        secondary.setText(R.string.forget_desktop)
+        secondary.setOnClickListener { forgetDesktop() }
+    }
+
+    private fun sendControlCommand(type: String, requestId: String? = null) {
+        val output = activeControlOutput ?: return
+        try {
+            synchronized(output) {
+                output.write(ControlProtocol.command(type, requestId).toByteArray(StandardCharsets.UTF_8))
+                output.write('\n'.code)
+                output.flush()
+            }
+        } catch (_: Exception) {
+            // Local Stop/Forget still takes effect if the peer is unreachable.
         }
     }
 

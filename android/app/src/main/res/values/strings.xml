@@ -11,4 +11,24 @@
     <string name="paired_success">Paired. Camera access has not started.</string>
     <string name="confirm_code">Confirm this code on both devices:\n\n%1$s\n\nPairing does not start the camera.</string>
     <string name="paired_with">Paired with %1$s</string>
+    <string name="ready_to_reconnect">Trusted. Start OmaCam on the laptop, then connect. Camera access still requires a separate approval.</string>
+    <string name="find_desktop">Find trusted laptop</string>
+    <string name="forget_desktop">Forget laptop</string>
+    <string name="desktop_forgotten">Laptop forgotten on this phone. Pair again to reconnect.</string>
+    <string name="searching_desktop">Looking only for the previously trusted laptop on this local network…</string>
+    <string name="authenticating_desktop">Trusted laptop found. Verifying both saved identities…</string>
+    <string name="discovery_failed">Local discovery failed (code %1$d). No network settings were changed.</string>
+    <string name="connected_to">Connected to %1$s</string>
+    <string name="control_connected">Authenticated control is connected. Camera access has not started.</string>
+    <string name="share_camera_title">Share camera with %1$s?</string>
+    <string name="share_camera_details">The laptop requested 1280×720 video at 30 fps. Nothing is shared until you approve. OmaCam never captures microphone audio.</string>
+    <string name="share_camera">Share camera</string>
+    <string name="decline">Decline</string>
+    <string name="camera_denied">Camera permission denied. Nothing was shared.</string>
+    <string name="capture_declined">Camera sharing declined.</string>
+    <string name="starting_camera">Approval sent. Verifying the capture session before opening the camera…</string>
+    <string name="sharing_with">Sharing camera with %1$s</string>
+    <string name="camera_live">Camera is live at 1280×720, 30 fps. No audio is captured.</string>
+    <string name="stop_camera">Stop camera</string>
+    <string name="capture_ended">Camera stopped: %1$s</string>
 </resources>
