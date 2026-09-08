@@ -4,11 +4,12 @@ Status: recommended design; concrete library versions and proof results remain o
 
 ## Shape of the system
 
-Use a modular Rust control daemon, a small output process, an Android companion, and a thin Omarchy QML plugin. These process boundaries protect the output lifecycle and desktop; they do not justify distributed services, a server database, or cloud infrastructure.
+Use a modular Rust control daemon, a small output process, ordered phone providers, and a thin Omarchy QML plugin. The providers are an already-enabled native UVC device, a securely qualified zero-install browser client, and an Android companion fallback. These process boundaries protect the output lifecycle and desktop; they do not justify distributed services, a server database, or cloud infrastructure.
 
 ```text
-Android companion
-  Camera2 -> MediaCodec -> authenticated local media transport
+Selected phone provider
+  UVC OR browser WebRTC OR companion Camera2/MediaCodec
+                    -> authenticated/owned local media source
                                   |
                                   v
                        media worker: receive/decode/normalize
@@ -36,6 +37,8 @@ A single decoding stage is the default. The exact placement of preview resizing 
 | Media worker | Authenticated media receive, decode, conversion, bounded queues, capture statistics | Trust changes, arbitrary device selection, shell integration |
 | Output writer | One validated loopback handle, fixed output mode, neutral-frame watchdog, bounded preview publication | Phone credentials, LAN listeners, control over unrelated video devices |
 | Android companion | Its identity key, peer trust, permission flow, camera lifecycle, encoder, session lease, Stop UI | Changing USB functions, root workarounds, hidden APIs, starting capture merely on discovery |
+| Browser provider | Secure-origin capture, browser permission flow, ephemeral peer proof, Stop UI | TLS bypass, reusable QR credentials, silent cloud media, assuming background capture survives |
+| UVC provider | Positively identified already-enabled phone source and its supported modes | Switching USB functions, claiming cryptographic identity from a label, taking unrelated cameras |
 | Package/setup workflow | Declared files, dependencies, scoped device setup, installation receipts | Long-running root daemon, arbitrary scripts from the network, unowned config rewrites |
 
 The daemon is the desktop source of truth. UI commands express intent; success is shown after observed completion. Android is the authority for camera permission and actual capture state. Kernel/output checks are the authority for virtual-camera readiness.
@@ -58,6 +61,8 @@ WebRTC is a starting recommendation, not a finalized protocol. Choose the actual
 ## Provider versus transport
 
 Separate capture capability from network reachability. The native provider can use Wi-Fi, hotspot IP, or an already-active USB-tether IP path. A new interface is not necessarily a new camera provider.
+
+Provider selection is ordered, observable, and non-mutating. First inspect for an already-enabled UVC phone without selecting an arbitrary `uvcvideo` device. Next offer the browser only if its exact browser/version has passed secure-context, local-network, signaling, identity, consent, and lifecycle qualification. Otherwise explain why and offer the companion. Remembering a successful provider may improve the next launch, but cannot bypass current capability or consent checks.
 
 Future UVC ingests a local video device; future scrcpy manages a narrowly scoped subprocess. Neither automatically shares the companion's cryptographic identity. Require explicit selection and a separately documented trust model. Serial numbers and friendly names alone cannot unify identities across providers.
 

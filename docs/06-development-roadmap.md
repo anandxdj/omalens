@@ -10,14 +10,14 @@ Work packages:
 
 1. Record actual Omarchy version/commit, plugin API, Quickshell/Qt versions, kernel, Secure Boot status, graphics stack, portal implementation, and existing loopback usage using read-only inspection.
 2. Record available Android models and OS versions. Decide minimum SDK, target SDK, and tested support matrix from actual API needs and distribution requirements.
-3. Resolve working name and proposed companion-first release scope. Reserve no public IDs before that decision.
-4. During authorized implementation, build disposable feasibility spikes: native camera capture to a maintained media stack; local authenticated media path; stable V4L2 output with neutral frames; preview delivery into the actual shell.
+3. Resolve working name and the ordered hybrid release scope: already-enabled UVC first, qualified zero-install browser second, companion fallback. Reserve no public IDs before that decision.
+4. During authorized implementation, build disposable feasibility spikes: positive UVC phone identification without USB mutation; secure browser capture/bootstrap; companion camera capture to a maintained media stack; local authenticated media path; stable V4L2 output with neutral frames; preview delivery into the actual shell.
 5. Measure baseline CPU, memory, copying cost, optical latency, and first-frame time. Test existing USB tethering and hotspot continuity without reconfiguration.
 6. Determine package installation privileges and a supported user-facing dependency installation path. Validate terminal-free onboarding instead of assuming the plugin installer provides it.
 
 Deliverables: environment matrix, spike results with reproduction steps, selected libraries/versions/licenses, resource budgets, installation design, updated decision register. Keep throwaway spikes outside final architecture unless explicitly adopted after review.
 
-Exit: at least one real phone can feed a qualified Linux consumer through the proposed media/output path, the preview mechanism is proven, and installer limitations are understood. Security shortcuts in isolated synthetic-media experiments cannot become product defaults. If a spike cannot be run, mark its dependent decision blocked and continue only independent design work.
+Exit: provider ordering has evidence instead of assumptions; at least one real phone can feed a qualified Linux consumer through a selected media/output path; the preview mechanism is proven; and installer limitations are understood. Security shortcuts in isolated synthetic-media experiments cannot become product defaults. If a spike cannot be run, mark its dependent decision blocked and continue only independent design work.
 
 ## G1 — Freeze contracts and security design
 
@@ -43,7 +43,7 @@ Exit: Chrome/Chromium, Firefox, and OBS on the qualification rig read output; th
 
 Dependencies: G1; G2 state/readiness reporting.
 
-Work: companion scanner and trust storage, invitation lifecycle, peer approval, authenticated control, Stop/Forget, session lease, local discovery hints, version rejection, and Ask/Auto-connect/Ignore semantics.
+Work: provider-appropriate trust storage, invitation lifecycle, peer approval, authenticated control, Stop/Forget, session lease, local discovery hints, version rejection, and Ask/Auto-connect/Ignore semantics. Companion installation is a fallback outcome, not a prerequisite to provider detection.
 
 Deliverables: end-to-end pairing without camera streaming, attack fixtures, restart and revocation tests.
 
@@ -99,7 +99,7 @@ Dependencies: released and measured MVP. Each expansion repeats contracts, secur
 | Native UVC | Explicit already-enabled source selection, device ownership, supported formats/controls, stable output; no assumed identity equivalence |
 | scrcpy | Pinned supported version, Android support boundary, existing ADB authorization, audio explicitly disabled, own-process cleanup, no shared ADB reset |
 | Physical lenses/manual controls | Valid session modes per device, friendly naming confidence, control dependencies and switching rollback |
-| Browser/PWA | Trusted secure context, authenticated signaling bootstrap, generic QR/app onboarding story, permission and background limits, no TLS bypass |
+| Browser/PWA | Trusted secure context, authenticated signaling bootstrap, QR onboarding, current Local Network Access behavior, permission and background limits, no TLS bypass; promote into the ordered MVP only after this proof |
 | Phone microphone | Explicit opt-in, PipeWire source ownership, no default routing changes, timestamp/drift synchronization, silence and revocation tests |
 | Automatic handover | Known-safe candidate, stable output mode, hysteresis, bounded gap, identity continuity, rollback, no concurrent camera assumption |
 

@@ -12,9 +12,9 @@ The product succeeds when a user installs supported components, pairs a phone, e
 
 | Release | Included | Not required for that release |
 | --- | --- | --- |
-| MVP / first usable release | Android companion; QR pairing; one active phone; local IP transport over an existing reachable network; front/rear selection where exposed; supported zoom, exposure compensation, and torch; 720p30 baseline on qualified hardware; shared-source preview; persistent V4L2 output while the output service is healthy; reconnect; black-screen UI; native Omarchy panel; scoped diagnostics and installation | Browser client, scrcpy, native UVC, custom USB protocol, phone audio, automatic provider handover, manual sensor controls, universal 1080p60 |
-| Expansion A | Existing USB-tether IP path qualification; UVC or scrcpy provider selected by evidence; more devices and quality profiles; accessible physical-lens controls; safe provider switching | Simultaneous capture from multiple phones |
-| Expansion B | Browser/PWA where secure onboarding is solved; opt-in phone microphone and synchronization; advanced controls; automatic safe handover; additional desktop frontends | Cloud media relay, recording, remote surveillance |
+| MVP / first usable release | Ordered provider onboarding: already-enabled native UVC first, securely qualified zero-install browser/PWA second, Android companion fallback; QR pairing where the selected provider requires it; one active phone; one qualified 720p30 path; shared-source preview; persistent V4L2 output while its service is healthy; reconnect; native Omarchy panel; scoped diagnostics and installation | scrcpy, custom USB protocol, phone audio, automatic provider handover, manual sensor controls, universal 1080p60 |
+| Expansion A | Existing USB-tether IP qualification; more devices and quality profiles; accessible physical-lens controls; safe user-initiated provider switching | Simultaneous capture from multiple phones |
+| Expansion B | Opt-in phone microphone and synchronization; advanced controls; automatic safe handover; additional desktop frontends | Cloud media relay, recording, remote surveillance |
 
 USB-tether and hotspot **non-interference tests are MVP requirements**, even when streaming over that specific route has not been qualified. A refused unsupported route is acceptable; breaking working networking is not. Do not market a transport as supported until it has passed its functional tests.
 
@@ -48,7 +48,7 @@ Recommended qualification starting point: Omarchy with the documented Quickshell
 ## UX flow and error behavior
 
 1. Open OmaCam. Run a read-only readiness check. If setup is incomplete, explain the missing component and show the supported installation path.
-2. If no trusted phone is selected, show pairing instructions. For MVP: install/open the companion and scan the desktop QR with its scanner. Do not pretend the generic Android camera opens a zero-install client.
+2. If no trusted phone is selected, evaluate providers in the fixed order: an already-enabled and positively identified UVC phone; a browser/PWA only when its secure bootstrap is qualified on the current browser; then the companion fallback. Never change USB functions automatically, pretend a generic LAN HTTP QR is secure, or require an app before provider detection has run.
 3. Show the prospective peer on both screens and complete the pairing approval ceremony. Request camera permission only as needed for scanning or capture, with the reason shown.
 4. Request Start. The phone shows the intended laptop and asks to share its camera. On approval, expose actual capture settings and preview; output becomes live only after readiness.
 5. Show camera selector, Automatic quality, current state, preview, and Disconnect. Advanced diagnostics are collapsed. Do not include inactive future-feature controls.
