@@ -3,6 +3,8 @@
 //! This crate deliberately contains no transport, UI, or operating-system code.
 //! Callers provide monotonic millisecond timestamps from one local clock.
 
+pub mod control;
+pub mod media;
 pub mod pairing;
 
 pub const DEFAULT_CAPTURE_LEASE_MS: u64 = 10_000;
@@ -50,6 +52,22 @@ pub enum PolicyError {
     SessionNotStreaming,
     StaleGeneration,
 }
+
+impl std::fmt::Display for PolicyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::PeerNotTrusted => "capture peer is not trusted",
+            Self::PeerOffline => "capture peer is offline",
+            Self::CaptureBusy => "another capture request or session is active",
+            Self::ConsentNotPending => "explicit phone consent is not pending",
+            Self::SessionNotStarting => "capture session is not starting",
+            Self::SessionNotStreaming => "capture session is not armed",
+            Self::StaleGeneration => "capture generation is stale",
+        })
+    }
+}
+
+impl std::error::Error for PolicyError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionSnapshot {
