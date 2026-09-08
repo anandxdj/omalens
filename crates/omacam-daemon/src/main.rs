@@ -1,11 +1,10 @@
+use std::collections::HashMap;
 use std::env;
-use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::{self, Write as IoWrite};
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,21 +17,34 @@ use qrcode::QrCode;
 use qrcode::render::{svg, unicode};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use serde::Serialize;
-use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
 use tokio::net::TcpListener;
 use tokio::time::{Instant, timeout};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::rustls::pki_types::PrivateKeyDer;
 
+mod capture;
+mod control_server;
+mod diagnostics;
+
+use control_server::{ControlServeOptions, run_control_server, write_json_line};
+#[cfg(test)]
+use diagnostics::{describe_uvc_candidate, reports_capture_only};
+use diagnostics::{doctor_report, provider_report};
+
 const USAGE: &str = "Usage:
   omacam-daemon doctor
+  omacam-daemon providers
   omacam-daemon snapshot
   omacam-daemon pair serve --endpoint <LAN_IP:PORT> [--listen <IP:PORT>] [--name <NAME>] [--qr <SVG_PATH>] [--trust <JSON_PATH>] [--identity <JSON_PATH>]
   omacam-daemon pair status [--trust <JSON_PATH>]
-  omacam-daemon pair forget [--trust <JSON_PATH>]";
+  omacam-daemon pair forget [--trust <JSON_PATH>]
+  omacam-daemon control serve --listen <IP:PORT> [--request-start --output-device /dev/videoN] [--trust <JSON_PATH>] [--identity <JSON_PATH>]";
 const MAX_CONTROL_MESSAGE_BYTES: u64 = 65_536;
 const CLIENT_STEP_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_PAIRING_FAILURES_PER_SOURCE: u8 = 5;
+const MAX_PAIRING_FAILURES_GLOBAL: u8 = 20;
 
 #[tokio::main]
 async fn main() {
@@ -40,6 +52,10 @@ async fn main() {
     let exit_code = match args.first().map(String::as_str) {
         Some("doctor") => {
             print!("{}", doctor_report());
+            0
+        }
+        Some("providers") => {
+            print!("{}", provider_report());
             0
         }
         Some("snapshot") => {
@@ -83,6 +99,21 @@ async fn main() {
                 Err(error) => {
                     eprintln!("{error}");
                     1
+                }
+            }
+        }
+        Some("control") if args.get(1).map(String::as_str) == Some("serve") => {
+            match ControlServeOptions::parse(&args[2..]) {
+                Ok(options) => match run_control_server(&options).await {
+                    Ok(()) => 0,
+                    Err(error) => {
+                        eprintln!("Control authentication failed: {error}");
+                        1
+                    }
+                },
+                Err(error) => {
+                    eprintln!("{error}\n\n{USAGE}");
+                    2
                 }
             }
         }
@@ -196,7 +227,7 @@ async fn run_pair_server(options: PairServeOptions) -> Result<(), Box<dyn std::e
     println!("QR image: {}", options.qr_path.display());
     println!("Waiting for a phone for {INVITATION_LIFETIME_SECS} seconds…");
 
-    let listener = TcpListener::bind(options.listen).await?;
+    let listener = Arc::new(TcpListener::bind(options.listen).await?);
     let started = Instant::now();
     let mut session = PairingSession::new(invitation, 0);
     let outcome = tokio::select! {
@@ -229,16 +260,25 @@ async fn wait_for_valid_claim(
     started: &Instant,
     session: &mut PairingSession,
 ) -> Result<(PairStream, VerifiedClaim), Box<dyn std::error::Error>> {
+    let mut source_failures = HashMap::<IpAddr, u8>::new();
+    let mut global_failures = 0_u8;
     loop {
         let remaining =
             Duration::from_secs(INVITATION_LIFETIME_SECS).saturating_sub(started.elapsed());
         if remaining.is_zero() {
             return Err("invitation expired".into());
         }
-        let (socket, _) = timeout(remaining, listener.accept())
+        let (socket, peer) = timeout(remaining, listener.accept())
             .await
             .map_err(|_| "invitation expired")??;
+        if source_failures
+            .get(&peer.ip())
+            .is_some_and(|failures| *failures >= MAX_PAIRING_FAILURES_PER_SOURCE)
+        {
+            continue;
+        }
         let Ok(Ok(tls_stream)) = timeout(CLIENT_STEP_TIMEOUT, acceptor.accept(socket)).await else {
+            record_pairing_failure(&mut source_failures, &mut global_failures, peer.ip())?;
             continue;
         };
         let mut stream = BufReader::new(tls_stream);
@@ -251,9 +291,11 @@ async fn wait_for_valid_claim(
         )
         .await;
         let Ok(Ok(bytes_read)) = read else {
+            record_pairing_failure(&mut source_failures, &mut global_failures, peer.ip())?;
             continue;
         };
         if bytes_read == 0 || bytes_read as u64 > MAX_CONTROL_MESSAGE_BYTES {
+            record_pairing_failure(&mut source_failures, &mut global_failures, peer.ip())?;
             continue;
         }
         if message.last() == Some(&b'\n') {
@@ -267,6 +309,7 @@ async fn wait_for_valid_claim(
                 },
             )
             .await?;
+            record_pairing_failure(&mut source_failures, &mut global_failures, peer.ip())?;
             continue;
         };
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -278,10 +321,25 @@ async fn wait_for_valid_claim(
                 },
             )
             .await?;
+            record_pairing_failure(&mut source_failures, &mut global_failures, peer.ip())?;
             continue;
         };
         return Ok((stream, verified.clone()));
     }
+}
+
+fn record_pairing_failure(
+    source_failures: &mut HashMap<IpAddr, u8>,
+    global_failures: &mut u8,
+    source: IpAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let failures = source_failures.entry(source).or_default();
+    *failures = failures.saturating_add(1);
+    *global_failures = global_failures.saturating_add(1);
+    if *global_failures >= MAX_PAIRING_FAILURES_GLOBAL {
+        return Err("pairing invitation rejected after too many failed attempts".into());
+    }
+    Ok(())
 }
 
 async fn run_pairing_ceremony(
@@ -346,17 +404,6 @@ enum ServerReply<'a> {
     },
 }
 
-async fn write_json_line<W: tokio::io::AsyncWrite + Unpin>(
-    writer: &mut W,
-    reply: &ServerReply<'_>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut encoded = serde_json::to_vec(reply)?;
-    encoded.push(b'\n');
-    writer.write_all(&encoded).await?;
-    writer.flush().await?;
-    Ok(())
-}
-
 fn write_qr_svg(path: &Path, payload: &str) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = path.parent() {
         create_private_parent(parent)?;
@@ -391,6 +438,28 @@ struct TrustRecord {
     phone_name: String,
     phone_public_key_der_base64url: String,
     phone_key_sha256_base64url: String,
+}
+
+fn load_trust_record(path: &Path) -> Result<TrustRecord, Box<dyn std::error::Error>> {
+    if !path.exists() {
+        return Err("no trusted phone; pair before starting control".into());
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err("trust record must be a private non-symlink regular file".into());
+    }
+    let bytes = std::fs::read(path)?;
+    if bytes.len() > 16_384 {
+        return Err("trust record exceeds size limit".into());
+    }
+    let record: TrustRecord = serde_json::from_slice(&bytes)?;
+    if record.schema_version != 1 {
+        return Err("unsupported trust-record version".into());
+    }
+    Ok(record)
 }
 
 #[derive(Serialize, serde::Deserialize)]
@@ -567,137 +636,6 @@ fn default_data_path(file_name: &str) -> std::path::PathBuf {
     )
 }
 
-fn doctor_report() -> String {
-    let mut report = String::from("OmaCam host readiness (read-only)\n");
-    add_command_check(&mut report, "Omarchy", "omarchy", &["version"]);
-    add_command_check(&mut report, "Quickshell", "quickshell", &["--version"]);
-    add_command_check(&mut report, "GStreamer", "gst-launch-1.0", &["--version"]);
-    add_gstreamer_element(&mut report, "GStreamer V4L2 output", "v4l2sink");
-    add_gstreamer_element(&mut report, "GStreamer WebRTC", "webrtcbin");
-    add_command_check(&mut report, "V4L2 tools", "v4l2-ctl", &["--version"]);
-    add_command_check(&mut report, "ADB (future adapter)", "adb", &["version"]);
-
-    let video_devices = count_video_devices();
-    let _ = writeln!(
-        report,
-        "{:<28} {} ({video_devices} device(s))",
-        "Linux video devices",
-        if video_devices == 0 {
-            "MISSING"
-        } else {
-            "READY"
-        }
-    );
-    let module_loaded = Path::new("/sys/module/v4l2loopback").exists();
-    let _ = writeln!(
-        report,
-        "{:<28} {}",
-        "v4l2loopback module",
-        if module_loaded { "READY" } else { "MISSING" }
-    );
-    let oma_device = find_omacam_labeled_device();
-    let _ = writeln!(
-        report,
-        "{:<28} {}",
-        "OmaCam-labeled device",
-        oma_device
-            .as_deref()
-            .map_or("MISSING".to_owned(), |path| format!(
-                "FOUND — {}",
-                path.display()
-            ))
-    );
-    let writer_ready = oma_device.as_deref().is_some_and(output_writer_ready);
-    let _ = writeln!(
-        report,
-        "{:<28} {}",
-        "OmaCam output writer",
-        if writer_ready { "READY" } else { "INACTIVE" }
-    );
-    report.push_str(
-        "\nMISSING means setup or qualification is still required; no repair was attempted.\n",
-    );
-    report
-}
-
-fn add_command_check(report: &mut String, label: &str, program: &str, args: &[&str]) {
-    let result = Command::new(program).args(args).output();
-    match result {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let version = stdout
-                .lines()
-                .chain(stderr.lines())
-                .find(|line| !line.trim().is_empty())
-                .unwrap_or("available");
-            let _ = writeln!(report, "{label:<28} READY — {}", version.trim());
-        }
-        Ok(output) => {
-            let _ = writeln!(report, "{label:<28} ERROR — exited with {}", output.status);
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let _ = writeln!(report, "{label:<28} MISSING — {program}");
-        }
-        Err(error) => {
-            let _ = writeln!(report, "{label:<28} ERROR — {error}");
-        }
-    }
-}
-
-fn add_gstreamer_element(report: &mut String, label: &str, element: &str) {
-    let status = Command::new("gst-inspect-1.0")
-        .arg(element)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()
-        .filter(std::process::ExitStatus::success);
-    let _ = writeln!(
-        report,
-        "{label:<28} {} — {element}",
-        if status.is_some() { "READY" } else { "MISSING" }
-    );
-}
-
-fn count_video_devices() -> usize {
-    std::fs::read_dir("/dev")
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("video"))
-        .count()
-}
-
-fn find_omacam_labeled_device() -> Option<std::path::PathBuf> {
-    std::fs::read_dir("/sys/class/video4linux")
-        .ok()?
-        .filter_map(Result::ok)
-        .find_map(|entry| {
-            let name = std::fs::read_to_string(entry.path().join("name")).ok()?;
-            if name.trim() == "OmaCam Camera" {
-                Some(Path::new("/dev").join(entry.file_name()))
-            } else {
-                None
-            }
-        })
-}
-
-fn output_writer_ready(device: &Path) -> bool {
-    let output = Command::new("v4l2-ctl")
-        .arg("-d")
-        .arg(device)
-        .arg("--all")
-        .output();
-    output.is_ok_and(|output| {
-        output.status.success() && reports_capture_only(&String::from_utf8_lossy(&output.stdout))
-    })
-}
-
-fn reports_capture_only(report: &str) -> bool {
-    report.contains("Video Capture") && !report.contains("Video Output")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,5 +696,37 @@ mod tests {
         assert_eq!(mode, 0o600);
         assert!(write_qr_svg(&path, "replacement").is_err());
         std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn pairing_failure_quota_is_bounded_globally_and_per_source() {
+        let mut sources = HashMap::new();
+        let mut global = 0;
+        let source: IpAddr = "192.168.50.20".parse().expect("test IP");
+
+        for _ in 0..MAX_PAIRING_FAILURES_PER_SOURCE {
+            record_pairing_failure(&mut sources, &mut global, source).expect("below global quota");
+        }
+
+        assert_eq!(sources[&source], MAX_PAIRING_FAILURES_PER_SOURCE);
+        for suffix in 21..35 {
+            let other: IpAddr = format!("192.168.50.{suffix}").parse().expect("test IP");
+            record_pairing_failure(&mut sources, &mut global, other).expect("below global quota");
+        }
+        let final_source: IpAddr = "192.168.50.35".parse().expect("test IP");
+        assert!(record_pairing_failure(&mut sources, &mut global, final_source).is_err());
+        assert_eq!(global, MAX_PAIRING_FAILURES_GLOBAL);
+    }
+
+    #[test]
+    fn provider_detection_accepts_uvc_and_rejects_unrelated_video_devices() {
+        let uvc = "ID_USB_DRIVER=uvcvideo\nID_VENDOR=OnePlus\nID_MODEL=Phone_Camera\n";
+        let unrelated = "ID_VENDOR=Virtual\nID_MODEL=Loopback\n";
+
+        assert_eq!(
+            describe_uvc_candidate("video2", uvc),
+            Some("/dev/video2: OnePlus — Phone_Camera".to_owned())
+        );
+        assert_eq!(describe_uvc_candidate("video42", unrelated), None);
     }
 }
