@@ -3,6 +3,8 @@
 //! This crate deliberately contains no transport, UI, or operating-system code.
 //! Callers provide monotonic millisecond timestamps from one local clock.
 
+pub mod pairing;
+
 pub const DEFAULT_CAPTURE_LEASE_MS: u64 = 10_000;
 pub const MAX_FRAME_AGE_MS: u64 = 500;
 
