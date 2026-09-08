@@ -1,12 +1,12 @@
 # G3-001 — Secure QR pairing vertical slice
 
-Status: implementation and desktop smoke checks complete; real-phone verification blocked until an Android device is visible to ADB.
+Status: secure happy-path pairing passed on a real OnePlus Nord 4; automated reconnect work continues in [G3-002](G3-002-authenticated-control.md); physical negative and revocation checks remain before closing G3.
 
 Requirements: R03, R04, R05, R17. Gate: partial G3 only. This slice establishes trust and deliberately does not start camera capture or media transport.
 
 ## What is implemented
 
-The desktop command creates a single 120-second invitation, renders it in the terminal and as a mode-0600 SVG, and listens on one explicitly selected private or link-local address. The QR contains a random 128-bit session identifier, a random 256-bit one-use token, a random 256-bit challenge, the concrete endpoint, expiry hint, desktop display name, and SHA-256 binding to the desktop certificate. The token and challenge are redacted from Rust debug output.
+The desktop command creates a single 120-second invitation, renders it in the terminal and as a mode-0600 SVG, and listens on one explicitly selected private or link-local address. The QR contains a random 128-bit session identifier, a random 256-bit one-use token, a random 256-bit challenge, the concrete endpoint, expiry hint, desktop display name, and SHA-256 binding to the desktop certificate. The token and challenge are redacted from Rust debug output. Failed attempts are capped at five per source and twenty globally for that invitation.
 
 The Android companion scans only QR codes through Google Play services, rejects unknown/oversized/version-mismatched input before connecting, accepts only numeric private or link-local endpoints, generates a P-256 identity key in Android Keystore, and signs a length-delimited canonical transcript. It connects with TLS 1.3 and accepts only the exact certificate fingerprint carried by the scanned QR. There is no accept-all trust manager, CA bypass fallback, cleartext mode, arbitrary URL opening, microphone access, or media start.
 
@@ -21,7 +21,9 @@ The persistent desktop identity is a self-signed certificate/key stored in an ap
 - Android `assembleDebug`, `lintDebug`, and `testDebugUnitTest`: build succeeds; lint reports no issues; no JVM unit-test source exists yet.
 - Debug APK signature verification passes with APK Signature Scheme v2. The artifact is `android/app/build/outputs/apk/debug/app-debug.apk`.
 - A live desktop listener bound to the current private Wi-Fi address and produced a mode-0600 QR/identity. The no-client invitation expired after 120 seconds and removed its QR. A second run was cancelled with Ctrl-C and also removed its QR.
-- `/tmp/omacam-android-sdk/platform-tools/adb devices -l` returned no devices. Therefore scanning, Kotlin/Rust transcript interoperability, TLS pinning on Android, the two-screen code, trust commit across both devices, and OEM behavior are **not yet physically verified**.
+- Initial pairing timed out before reaching the desktop. Read-only diagnosis confirmed the daemon had listened on `0.0.0.0:47123`, the laptop was a client of the OnePlus hotspot at `10.87.237.216`, the phone was the gateway at `10.87.237.176`, local TLS 1.3 negotiation succeeded, and UFW was active. No firewall was changed automatically.
+- After the user explicitly allowed TCP 47123 from `10.87.237.176`, the real phone completed scanning, Kotlin/Rust transcript verification, pinned TLS, matching-code confirmation, and the two-party trust commit. `pair status` reports `OnePlus CPH2661` with a stored public identity fingerprint.
+- This verifies the real-device happy path on one network/device combination. It does not yet prove expiry/replay/race rejection on Android, restart authentication, Forget on both peers, broader OEM support, or terminal-free firewall setup.
 
 ## First real-phone test
 
