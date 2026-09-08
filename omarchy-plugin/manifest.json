@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "dev.omacam",
+  "name": "OmaCam",
+  "version": "0.1.0",
+  "author": "OmaCam contributors",
+  "description": "Use an Android phone as an Omarchy camera",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaCam",
+    "description": "Camera connection and readiness",
+    "category": "System",
+    "aliases": ["camera", "phone-camera", "webcam"],
+    "allowMultiple": false
+  }
+}
+
