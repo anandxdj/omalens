@@ -6,7 +6,7 @@ import java.nio.charset.StandardCharsets
 internal sealed interface ControlResponse {
     data class Pong(val captureAuthorized: Boolean) : ControlResponse
     data class StartRequest(val requestId: String, val desktopName: String) : ControlResponse
-    data class CaptureGranted(val binding: CaptureBinding) : ControlResponse
+    data class CaptureGranted(val requestId: String, val binding: CaptureBinding) : ControlResponse
     data class Stopped(val reason: String) : ControlResponse
     data class StopCapture(val reason: String) : ControlResponse
     data object Forgotten : ControlResponse
@@ -64,13 +64,23 @@ internal object ControlProtocol {
                 ControlResponse.StartRequest(requestId, name)
             }
             "capture_granted" -> {
-                requireKeys(json, "type", "peer", "connection", "session", "generation")
+                requireKeys(
+                    json,
+                    "type",
+                    "request_id",
+                    "peer",
+                    "connection",
+                    "session",
+                    "generation",
+                )
+                val requestId = json.getString("request_id").also { it.decodeExactControl(16) }
                 val peer = json.getString("peer").also { requireHex(it, 64) }
                 val connection = json.getString("connection").also { requireHex(it, 32) }
                 val session = json.getString("session").also { requireHex(it, 32) }
                 val generation = json.getLong("generation")
                 require(generation > 0) { "Capture generation is invalid" }
                 ControlResponse.CaptureGranted(
+                    requestId,
                     CaptureBinding(peer, connection, session, generation),
                 )
             }

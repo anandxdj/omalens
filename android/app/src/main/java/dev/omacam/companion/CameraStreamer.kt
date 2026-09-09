@@ -43,8 +43,10 @@ internal class CameraStreamer(
     private val leaseDeadline = AtomicLong(0)
     private val terminalSent = AtomicBoolean(false)
     private val nextSequence = AtomicLong(0)
+    private val callbackGate = CaptureCallbackGate()
+    @Volatile private var callbackGeneration = 0L
     private val thread = Thread(::run, "omacam-camera-stream")
-    @Volatile private var socket: SSLSocket? = null
+    @Volatile private var socket: Socket? = null
     @Volatile private var output: DataOutputStream? = null
     @Volatile private var camera: CameraDevice? = null
     @Volatile private var session: CameraCaptureSession? = null
@@ -54,6 +56,7 @@ internal class CameraStreamer(
 
     fun start() {
         check(active.compareAndSet(false, true)) { "Capture pipeline is already active" }
+        callbackGeneration = callbackGate.start()
         refreshLease()
         thread.start()
     }
@@ -64,19 +67,31 @@ internal class CameraStreamer(
 
     /** Invalidate first, then send terminal Stop and release owned resources. */
     fun stop(reason: String) {
-        if (active.getAndSet(false)) {
-            sendTerminalStop()
+        val wasActive = active.getAndSet(false)
+        callbackGate.stop(callbackGeneration)
+        // Closing the transport first interrupts a blocked media write. Stop is
+        // local and must not wait for a stalled network peer before cleanup.
+        try {
             socket?.close()
+        } catch (_: Exception) {
+            // The remaining owned resources still need to be released.
         }
+        if (wasActive || output != null) sendTerminalStop()
         if (Thread.currentThread() !== thread) thread.join(1_000)
         releaseResources()
     }
 
     private fun run() {
+        val generation = callbackGeneration
         var reason = "Capture ended"
         try {
-            val mediaOutput = openAuthenticatedMedia()
-            output = DataOutputStream(mediaOutput)
+            callbackGate.acquire(
+                generation,
+                create = { openAuthenticatedMedia(generation) },
+                publish = { output = DataOutputStream(it) },
+                releaseLate = { it.close() },
+            )
+            callbackGate.requireCurrent(generation)
             val selectedCamera = selectCamera()
             configureEncoderAndCamera(selectedCamera)
             drainEncoder()
@@ -87,18 +102,23 @@ internal class CameraStreamer(
             reason = error.message ?: "Camera pipeline failed"
         } finally {
             active.set(false)
+            callbackGate.stop(generation)
             sendTerminalStop()
             releaseResources()
             onStopped(reason)
         }
     }
 
-    private fun openAuthenticatedMedia(): BufferedOutputStream {
+    private fun openAuthenticatedMedia(generation: Long): BufferedOutputStream {
         val trustManager = PairingProtocol.pinningTrustManager(trustedCertificate.decodeBase64Url())
         val tlsContext = SSLContext.getInstance("TLSv1.3").apply {
             init(null, arrayOf(trustManager), null)
         }
         val plain = Socket()
+        if (!callbackGate.publish(generation) { socket = plain }) {
+            plain.close()
+            error("Capture startup was cancelled")
+        }
         plain.connect(InetSocketAddress(endpoint.host, endpoint.port), 5_000)
         plain.soTimeout = 10_000
         val tls = tlsContext.socketFactory.createSocket(
@@ -107,7 +127,10 @@ internal class CameraStreamer(
             endpoint.port,
             true,
         ) as SSLSocket
-        socket = tls
+        if (!callbackGate.publish(generation) { socket = tls }) {
+            tls.close()
+            error("Capture startup was cancelled")
+        }
         tls.enabledProtocols = arrayOf("TLSv1.3")
         tls.startHandshake()
         val input = BufferedInputStream(tls.inputStream)
@@ -160,8 +183,13 @@ internal class CameraStreamer(
     @SuppressLint("MissingPermission")
     @Suppress("DEPRECATION")
     private fun configureEncoderAndCamera(selected: SelectedCamera) {
-        val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        encoder = codec
+        val generation = callbackGeneration
+        val codec = callbackGate.acquire(
+            generation,
+            create = { MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC) },
+            publish = { encoder = it },
+            releaseLate = { it.release() },
+        )
         val format = MediaFormat.createVideoFormat(
             MediaFormat.MIMETYPE_VIDEO_AVC,
             TARGET_SIZE.width,
@@ -175,33 +203,57 @@ internal class CameraStreamer(
             setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel31)
         }
         codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        val surface = codec.createInputSurface()
-        encoderSurface = surface
+        callbackGate.requireCurrent(generation)
+        val surface = callbackGate.acquire(
+            generation,
+            create = codec::createInputSurface,
+            publish = { encoderSurface = it },
+            releaseLate = { it.release() },
+        )
         codec.start()
+        callbackGate.requireCurrent(generation)
 
-        val handlerThread = HandlerThread("omacam-camera2").also { it.start() }
-        cameraThread = handlerThread
+        val handlerThread = callbackGate.acquire(
+            generation,
+            create = { HandlerThread("omacam-camera2").also { it.start() } },
+            publish = { cameraThread = it },
+            releaseLate = {
+                it.quitSafely()
+                it.join(1_000)
+            },
+        )
         val handler = Handler(handlerThread.looper)
         val manager = context.getSystemService(CameraManager::class.java)
         val cameraLatch = CountDownLatch(1)
         val failure = AtomicReference<String?>()
+        lateinit var openedCamera: CameraDevice
+        lateinit var configuredSession: CameraCaptureSession
+        val callbacks = CaptureStartupCallbacks(
+            callbackGate,
+            generation,
+            publishCamera = { camera = openedCamera },
+            publishSession = { session = configuredSession },
+            fail = { reason ->
+                failure.compareAndSet(null, reason)
+                active.set(false)
+            },
+        )
         manager.openCamera(
             selected.id,
             object : CameraDevice.StateCallback() {
                 override fun onOpened(device: CameraDevice) {
-                    camera = device
+                    openedCamera = device
+                    callbacks.cameraOpened(device::close)
                     cameraLatch.countDown()
                 }
 
                 override fun onDisconnected(device: CameraDevice) {
-                    failure.set("Camera disconnected")
-                    device.close()
+                    callbacks.cameraDisconnected(device::close)
                     cameraLatch.countDown()
                 }
 
                 override fun onError(device: CameraDevice, error: Int) {
-                    failure.set("Camera failed with code $error")
-                    device.close()
+                    callbacks.cameraError(error, device::close)
                     cameraLatch.countDown()
                 }
             },
@@ -209,19 +261,20 @@ internal class CameraStreamer(
         )
         require(cameraLatch.await(5, TimeUnit.SECONDS)) { "Timed out opening camera" }
         failure.get()?.let(::error)
+        callbackGate.requireCurrent(generation)
         val opened = camera ?: error("Camera did not open")
         val sessionLatch = CountDownLatch(1)
         opened.createCaptureSession(
             listOf(surface),
             object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(configured: CameraCaptureSession) {
-                    session = configured
+                    configuredSession = configured
+                    callbacks.sessionConfigured(configured::close)
                     sessionLatch.countDown()
                 }
 
                 override fun onConfigureFailed(configured: CameraCaptureSession) {
-                    failure.set("Camera capture session configuration failed")
-                    configured.close()
+                    callbacks.sessionConfigureFailed(configured::close)
                     sessionLatch.countDown()
                 }
             },
@@ -229,6 +282,7 @@ internal class CameraStreamer(
         )
         require(sessionLatch.await(5, TimeUnit.SECONDS)) { "Timed out configuring camera" }
         failure.get()?.let(::error)
+        callbackGate.requireCurrent(generation)
         val request = opened.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
             addTarget(surface)
             set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, selected.fpsRange)
@@ -259,7 +313,6 @@ internal class CameraStreamer(
                         codecConfig = encoded
                     } else if (encoded.isNotEmpty()) {
                         val payload = if (keyFrame && codecConfig.isNotEmpty()) codecConfig + encoded else encoded
-                        require(payload.size <= MAX_ACCESS_UNIT_BYTES) { "Encoded access unit exceeds 1 MiB" }
                         val sequence = nextSequence.getAndIncrement()
                         writeMediaRecord(sequence, info.presentationTimeUs, keyFrame, payload)
                     }
@@ -283,19 +336,7 @@ internal class CameraStreamer(
     private fun writeMediaRecord(sequence: Long, timestampUs: Long, keyFrame: Boolean, payload: ByteArray) {
         if (!active.get()) return
         val target = output ?: error("Authenticated media output is unavailable")
-        target.write(MEDIA_MAGIC)
-        target.writeByte(1)
-        target.writeByte(1)
-        target.writeShort(if (keyFrame) 1 else 0)
-        target.write(binding.peer.hexBytes(32))
-        target.write(binding.connection.hexBytes(16))
-        target.write(binding.session.hexBytes(16))
-        target.writeLong(binding.generation)
-        target.writeLong(sequence)
-        target.writeLong(timestampUs)
-        target.writeInt(payload.size)
-        target.write(payload)
-        target.flush()
+        MediaProtocol.writeAccessUnit(target, binding, sequence, timestampUs, keyFrame, payload)
     }
 
     @Synchronized
@@ -303,42 +344,48 @@ internal class CameraStreamer(
         if (!terminalSent.compareAndSet(false, true)) return
         val target = output ?: return
         try {
-            target.write(MEDIA_MAGIC)
-            target.writeByte(1)
-            target.writeByte(2)
-            target.writeShort(0)
-            target.write(binding.peer.hexBytes(32))
-            target.write(binding.connection.hexBytes(16))
-            target.write(binding.session.hexBytes(16))
-            target.writeLong(binding.generation)
-            target.writeLong(nextSequence.get())
-            target.writeLong(0)
-            target.writeInt(0)
-            target.flush()
+            MediaProtocol.writeStop(target, binding, nextSequence.get())
         } catch (_: Exception) {
             // Local invalidation and deterministic release do not depend on reachability.
         }
     }
 
-    @Synchronized
     private fun releaseResources() {
-        try { session?.stopRepeating() } catch (_: Exception) { }
-        try { session?.abortCaptures() } catch (_: Exception) { }
-        session?.close()
-        session = null
-        camera?.close()
-        camera = null
-        try { encoder?.stop() } catch (_: Exception) { }
-        encoder?.release()
-        encoder = null
-        encoderSurface?.release()
-        encoderSurface = null
-        output = null
-        try { socket?.close() } catch (_: Exception) { }
-        socket = null
-        cameraThread?.quitSafely()
-        cameraThread = null
+        val owned = synchronized(this) {
+            OwnedResources(
+                session = session.also { session = null },
+                camera = camera.also { camera = null },
+                encoder = encoder.also { encoder = null },
+                encoderSurface = encoderSurface.also { encoderSurface = null },
+                output = output.also { output = null },
+                socket = socket.also { socket = null },
+                cameraThread = cameraThread.also { cameraThread = null },
+            )
+        }
+        CaptureResourceCleanup.release(
+            { owned.session?.stopRepeating() },
+            { owned.session?.abortCaptures() },
+            { owned.session?.close() },
+            { owned.camera?.close() },
+            { owned.encoder?.stop() },
+            { owned.encoder?.release() },
+            { owned.encoderSurface?.release() },
+            { owned.output?.close() },
+            { owned.socket?.close() },
+            { owned.cameraThread?.quitSafely() },
+            { owned.cameraThread?.join(1_000) },
+        )
     }
+
+    private data class OwnedResources(
+        val session: CameraCaptureSession?,
+        val camera: CameraDevice?,
+        val encoder: MediaCodec?,
+        val encoderSurface: Surface?,
+        val output: DataOutputStream?,
+        val socket: Socket?,
+        val cameraThread: HandlerThread?,
+    )
 
     private fun readBoundedLine(input: BufferedInputStream): String {
         val bytes = java.io.ByteArrayOutputStream()
@@ -358,17 +405,8 @@ internal class CameraStreamer(
     }
 
     companion object {
-        private val MEDIA_MAGIC = "OMACAMM1".toByteArray(StandardCharsets.US_ASCII)
         private val TARGET_SIZE = Size(1280, 720)
         private const val TARGET_FPS = 30
         private const val LEASE_MILLIS = 10_000L
-        private const val MAX_ACCESS_UNIT_BYTES = 1_048_576
-    }
-}
-
-private fun String.hexBytes(expected: Int): ByteArray {
-    require(length == expected * 2) { "Capture binding length is invalid" }
-    return ByteArray(expected) { index ->
-        substring(index * 2, index * 2 + 2).toInt(16).toByte()
     }
 }

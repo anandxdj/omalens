@@ -4,7 +4,6 @@ import android.annotation.SuppressLint
 import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
-import android.util.Base64
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.net.InetAddress
@@ -17,6 +16,7 @@ import java.security.MessageDigest
 import java.security.SecureRandom
 import java.security.Signature
 import java.security.cert.X509Certificate
+import java.util.Base64
 import javax.net.ssl.X509TrustManager
 
 internal const val MAX_QR_BYTES = 4_096
@@ -334,11 +334,11 @@ private fun truncateUtf8(value: String, maximumBytes: Int): String {
 }
 
 internal fun String.decodeBase64Url(): ByteArray =
-    Base64.decode(this, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+    Base64.getUrlDecoder().decode(this)
 
 private fun String.decodeExact(size: Int): ByteArray = decodeBase64Url().also {
     require(it.size == size) { "QR field has an invalid length" }
 }
 
 private fun ByteArray.base64Url(): String =
-    Base64.encodeToString(this, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+    Base64.getUrlEncoder().withoutPadding().encodeToString(this)

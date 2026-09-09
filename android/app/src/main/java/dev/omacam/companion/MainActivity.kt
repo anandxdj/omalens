@@ -38,15 +38,18 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var activeSocket: Socket? = null
     @Volatile private var activeControlOutput: BufferedOutputStream? = null
     @Volatile private var cameraStreamer: CameraStreamer? = null
+    private val capturePolicy = CaptureSessionPolicy()
     @Volatile private var resolvingService = false
     private var pendingClaim: PreparedClaim? = null
     private var pendingStart: ControlResponse.StartRequest? = null
+    private var cameraPermissionRequestInFlight = false
     private var activeTrustedDesktop: TrustedDesktop? = null
     private var activeEndpoint: Endpoint? = null
     private var discoveryListener: NsdManager.DiscoveryListener? = null
     private val cameraPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
+        cameraPermissionRequestInFlight = false
         val request = pendingStart ?: return@registerForActivityResult
         if (granted) approveStart(request) else rejectStart(request, getString(R.string.camera_denied))
     }
@@ -68,14 +71,19 @@ class MainActivity : AppCompatActivity() {
         stopDiscovery()
         stopCapture("App closed")
         sendControlCommand("disconnect")
-        activeSocket?.close()
+        closeActiveSocket()
         worker.shutdownNow()
         controlSender.shutdownNow()
         super.onDestroy()
     }
 
     override fun onPause() {
-        if (cameraStreamer != null) stopCapture("OmaCam left the foreground")
+        if (cameraStreamer != null ||
+            (capturePolicy.phase() != CaptureSessionPolicy.Phase.Idle &&
+                !cameraPermissionRequestInFlight)
+        ) {
+            stopCapture("OmaCam left the foreground")
+        }
         super.onPause()
     }
 
@@ -154,7 +162,7 @@ class MainActivity : AppCompatActivity() {
         secondary.isEnabled = false
         controlSender.execute {
             sendControlCommand("forget_peer")
-            activeSocket?.close()
+            closeActiveSocket()
             runOnUiThread {
                 if (!isDestroyed) showReady(getString(R.string.desktop_forgotten))
             }
@@ -191,7 +199,7 @@ class MainActivity : AppCompatActivity() {
         secondary.visibility = View.VISIBLE
         secondary.setText(R.string.cancel)
         secondary.setOnClickListener {
-            activeSocket?.close()
+            closeActiveSocket()
             showReady()
         }
     }
@@ -325,7 +333,7 @@ class MainActivity : AppCompatActivity() {
                 activeControlOutput = null
                 activeTrustedDesktop = null
                 activeEndpoint = null
-                activeSocket?.close()
+                closeActiveSocket()
                 activeSocket = null
             }
         }
@@ -391,15 +399,16 @@ class MainActivity : AppCompatActivity() {
         when (response) {
             is ControlResponse.Pong -> {
                 val streamer = cameraStreamer
-                if (response.captureAuthorized && streamer != null) {
+                val streaming = capturePolicy.phase() is CaptureSessionPolicy.Phase.Streaming
+                if (response.captureAuthorized && streamer != null && streaming) {
                     streamer.refreshLease()
-                } else if (response.captureAuthorized || streamer != null) {
+                } else if (response.captureAuthorized || streamer != null || streaming) {
                     stopCapture("Capture authorization state changed unexpectedly")
                     error("Desktop capture state does not match the phone")
                 }
             }
             is ControlResponse.StartRequest -> runOnUiThread { showStartRequest(response) }
-            is ControlResponse.CaptureGranted -> startCapture(response.binding)
+            is ControlResponse.CaptureGranted -> startCapture(response.requestId, response.binding)
             is ControlResponse.Stopped -> {
                 stopCapture(response.reason)
                 activeTrustedDesktop?.let { trusted ->
@@ -412,7 +421,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showStartRequest(request: ControlResponse.StartRequest) {
-        require(cameraStreamer == null && pendingStart == null) { "Another capture request is active" }
+        if (cameraStreamer != null || pendingStart != null ||
+            capturePolicy.phase() != CaptureSessionPolicy.Phase.Idle
+        ) {
+            sendControlCommand("start_rejected", request.requestId)
+            return
+        }
+        capturePolicy.offer(request.requestId)
         pendingStart = request
         title.text = getString(R.string.share_camera_title, request.desktopName)
         details.setText(R.string.share_camera_details)
@@ -425,6 +440,7 @@ class MainActivity : AppCompatActivity() {
             ) {
                 approveStart(request)
             } else {
+                cameraPermissionRequestInFlight = true
                 cameraPermission.launch(Manifest.permission.CAMERA)
             }
         }
@@ -436,6 +452,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun approveStart(request: ControlResponse.StartRequest) {
         require(pendingStart == request) { "Capture request is no longer pending" }
+        capturePolicy.approve(request.requestId)
         pendingStart = null
         primary.isEnabled = false
         secondary.isEnabled = false
@@ -445,21 +462,30 @@ class MainActivity : AppCompatActivity() {
 
     private fun rejectStart(request: ControlResponse.StartRequest, message: String) {
         if (pendingStart != request) return
+        if (!capturePolicy.reject(request.requestId)) return
         pendingStart = null
         sendControlCommand("start_rejected", request.requestId)
         val trusted = activeTrustedDesktop ?: return
         showTrusted(trusted, message)
     }
 
-    private fun startCapture(binding: CaptureBinding) {
+    private fun startCapture(requestId: String, binding: CaptureBinding) {
         require(cameraStreamer == null) { "A capture pipeline is already active" }
+        capturePolicy.grant(requestId, binding)
         val trusted = activeTrustedDesktop ?: error("Trusted desktop context is unavailable")
         val endpoint = activeEndpoint ?: error("Desktop endpoint is unavailable")
         lateinit var streamer: CameraStreamer
         streamer = CameraStreamer(this, trusted.certificateSha256, endpoint, binding) { reason ->
-            if (cameraStreamer === streamer) cameraStreamer = null
-            runOnUiThread {
-                if (!isDestroyed) showConnected(trusted, getString(R.string.capture_ended, reason))
+            if (cameraStreamer === streamer) {
+                capturePolicy.stop()
+                cameraStreamer = null
+                runOnUiThread {
+                    if (!isDestroyed && cameraStreamer == null &&
+                        capturePolicy.phase() == CaptureSessionPolicy.Phase.Idle
+                    ) {
+                        showConnected(trusted, getString(R.string.capture_ended, reason))
+                    }
+                }
             }
         }
         cameraStreamer = streamer
@@ -476,10 +502,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stopCapture(reason: String) {
-        val streamer = cameraStreamer ?: return
+        val previous = capturePolicy.stop()
+        pendingStart = null
+        cameraPermissionRequestInFlight = false
+        val streamer = cameraStreamer
         cameraStreamer = null
-        streamer.stop(reason)
-        sendControlCommand("stop")
+        streamer?.stop(reason)
+        if (previous != CaptureSessionPolicy.Phase.Idle) sendControlCommand("stop")
         val trusted = activeTrustedDesktop
         runOnUiThread {
             if (!isDestroyed && trusted != null) showConnected(trusted, getString(R.string.capture_ended, reason))
@@ -549,7 +578,11 @@ class MainActivity : AppCompatActivity() {
         require(result.getString("type") == "paired") {
             result.optString("reason", "desktop rejected pairing")
         }
-        socket.close()
+        try {
+            socket.close()
+        } catch (_: Exception) {
+            // Pairing has already been committed; a close failure is harmless.
+        }
     }
 
     private fun readBoundedLine(input: BufferedInputStream): String {
@@ -563,5 +596,13 @@ class MainActivity : AppCompatActivity() {
             bytes.write(next)
         }
         throw IllegalArgumentException("desktop response is too large")
+    }
+
+    private fun closeActiveSocket() {
+        try {
+            activeSocket?.close()
+        } catch (_: Exception) {
+            // Teardown remains best-effort; local trust/capture state is authoritative.
+        }
     }
 }
