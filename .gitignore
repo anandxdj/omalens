@@ -5,3 +5,7 @@
 *.log
 .idea/
 .vscode/
+/packaging/arch/pkg/
+/packaging/arch/src/
+*.pkg.tar.zst
+*.pkg.tar.zst.sig
