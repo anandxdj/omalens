@@ -58,9 +58,11 @@ BarWidget {
     text: "󰄀"
     slotSize: Style.bar.statusSlot
     tooltipText: panelLoader.item ? panelLoader.item.statusText : "OmaCam"
+    Accessible.role: Accessible.Button
+    Accessible.name: "OmaCam camera panel"
+    Accessible.description: panelLoader.item ? panelLoader.item.statusText : "Open OmaCam"
     onPressed: function(button) {
       if (button === Qt.LeftButton) root.togglePanel()
     }
   }
 }
-
