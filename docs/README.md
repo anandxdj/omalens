@@ -1,6 +1,6 @@
 # OmaCam development documentation
 
-Status: proposed product and engineering baseline, prepared 2026-09-08. Documentation only; no implementation or hardware validation has been performed.
+Status: proposed product and engineering baseline, prepared 2026-09-08. Implementation evidence and remaining gates are tracked separately under `docs/implementation/`; do not infer completion from this baseline.
 
 OmaCam turns one Android phone into one Linux webcam without changing existing networking or USB services. This repository is named `omalens`; the supplied plan calls the product **OmaCam**. Use OmaCam in these documents, but resolve the public name before reserving package names, application IDs, signing identities, or protocol namespaces.
 
