@@ -20,6 +20,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::rustls::pki_types::PrivateKeyDer;
 
+use crate::service_runtime::{ServiceIntent, ServiceRuntime};
 use crate::{
     CLIENT_STEP_TIMEOUT, MAX_CONTROL_MESSAGE_BYTES, capture, default_data_path, forget_trust,
     hostname_display_name, load_or_create_identity, load_trust_record,
@@ -27,11 +28,12 @@ use crate::{
 
 #[derive(Debug)]
 pub(crate) struct ControlServeOptions {
-    listen: SocketAddr,
-    trust_path: std::path::PathBuf,
-    identity_path: std::path::PathBuf,
+    pub(crate) listen: SocketAddr,
+    pub(crate) trust_path: std::path::PathBuf,
+    pub(crate) identity_path: std::path::PathBuf,
     request_start: bool,
-    output_device: Option<std::path::PathBuf>,
+    pub(crate) output_device: Option<std::path::PathBuf>,
+    pub(crate) preview_socket: Option<std::path::PathBuf>,
 }
 
 impl ControlServeOptions {
@@ -41,6 +43,7 @@ impl ControlServeOptions {
         let mut identity_path = default_data_path("desktop-identity.json");
         let mut request_start = false;
         let mut output_device = None;
+        let mut preview_socket = None;
         let mut index = 0;
         while index < args.len() {
             let flag = args[index].as_str();
@@ -62,6 +65,7 @@ impl ControlServeOptions {
                 "--trust" => trust_path = value.into(),
                 "--identity" => identity_path = value.into(),
                 "--output-device" => output_device = Some(value.into()),
+                "--preview-socket" => preview_socket = Some(value.into()),
                 _ => return Err(format!("unknown control option: {flag}")),
             }
             index += 2;
@@ -73,18 +77,114 @@ impl ControlServeOptions {
         if request_start != output_device.is_some() {
             return Err("--request-start and --output-device must be supplied together".to_owned());
         }
+        if preview_socket.is_some() && !request_start {
+            return Err("--preview-socket requires --request-start and --output-device".to_owned());
+        }
         Ok(Self {
             listen,
             trust_path,
             identity_path,
             request_start,
             output_device,
+            preview_socket,
         })
     }
+
+    pub(crate) fn parse_owned(args: &[String]) -> Result<Self, String> {
+        let mut parse_args = args.to_vec();
+        if !parse_args.iter().any(|value| value == "--request-start") {
+            parse_args.push("--request-start".to_owned());
+        }
+        let mut options = Self::parse(&parse_args)?;
+        options.request_start = false;
+        if options.output_device.is_none() {
+            return Err("--output-device is required for the owned service".to_owned());
+        }
+        Ok(options)
+    }
+}
+
+pub(crate) async fn run_owned_control_server(
+    options: &ControlServeOptions,
+    runtime: ServiceRuntime,
+    mut intent_rx: mpsc::Receiver<ServiceIntent>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The output worker is service-scoped: it is created before accepting any
+    // authenticated control connection and survives every capture generation.
+    let mut output = if let Some(device) = options.output_device.as_deref() {
+        match capture::OutputWorker::spawn_service(device, options.preview_socket.as_deref()) {
+            Ok(worker) => {
+                runtime.set_output_ready();
+                Some(worker)
+            }
+            Err(error) => {
+                runtime.set_output_failed(error.to_string());
+                eprintln!("OmaCam output unavailable: {error}");
+                None
+            }
+        }
+    } else {
+        runtime.set_output_failed("owned service requires an output device");
+        None
+    };
+
+    if load_trust_record(&options.trust_path).is_err() {
+        let mut output_health_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        loop {
+            tokio::select! {
+                signal = tokio::signal::ctrl_c() => {
+                    signal?;
+                    break;
+                }
+                intent = intent_rx.recv() => {
+                    let intent = intent.ok_or("service intent channel stopped")?;
+                    match intent {
+                        ServiceIntent::RequestStart { operation_id } => runtime.fail(
+                            &operation_id,
+                            "peer_not_trusted",
+                            "no trusted phone is available",
+                        ),
+                        ServiceIntent::Stop { operation_id }
+                        | ServiceIntent::ForgetPeer { operation_id } => {
+                            runtime.succeed(&operation_id);
+                        }
+                    }
+                }
+                _ = output_health_tick.tick() => {
+                    if let Some(worker) = output.as_mut()
+                        && let Err(error) = worker.check_health()
+                    {
+                        runtime.set_output_failed(error);
+                    }
+                }
+            }
+        }
+        if let Some(worker) = output.as_mut() {
+            worker.shutdown();
+        }
+        return Ok(());
+    }
+
+    run_control_server_inner(options, Some((&runtime, &mut intent_rx)), output).await
 }
 
 pub(crate) async fn run_control_server(
     options: &ControlServeOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let output = match options.output_device.as_deref() {
+        Some(device) => Some(capture::OutputWorker::spawn_service(
+            device,
+            options.preview_socket.as_deref(),
+        )?),
+        None => None,
+    };
+    run_control_server_inner(options, None, output).await
+}
+
+async fn run_control_server_inner(
+    options: &ControlServeOptions,
+    runtime: Option<(&ServiceRuntime, &mut mpsc::Receiver<ServiceIntent>)>,
+    mut output: Option<capture::OutputWorker>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let trust = load_trust_record(&options.trust_path)?;
     let trusted_public_key = URL_SAFE_NO_PAD
@@ -123,11 +223,15 @@ pub(crate) async fn run_control_server(
         &trust.phone_name,
         &options.trust_path,
         options.request_start,
-        options.output_device.as_deref(),
+        runtime,
+        output.as_mut(),
     )
     .await;
     let _ = discovery.unregister(&service_fullname);
     let _ = discovery.shutdown();
+    if let Some(worker) = output.as_mut() {
+        worker.shutdown();
+    }
     result
 }
 
@@ -136,9 +240,12 @@ pub(crate) enum ControlConnectionOutcome {
     Disconnected,
     ForgotPeer,
     Shutdown,
+    /// Capture ended, but the authenticated control connection remains usable
+    /// for pings and a later explicit Start request.
+    CaptureStopped,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_control_accept_loop(
     listener: Arc<TcpListener>,
     acceptor: &TlsAcceptor,
@@ -147,18 +254,74 @@ async fn run_control_accept_loop(
     phone_name: &str,
     trust_path: &Path,
     request_start: bool,
-    output_device: Option<&Path>,
+    mut runtime: Option<(&ServiceRuntime, &mut mpsc::Receiver<ServiceIntent>)>,
+    mut output: Option<&mut capture::OutputWorker>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut output_health_tick = tokio::time::interval(std::time::Duration::from_millis(250));
     loop {
-        let socket = tokio::select! {
-            accepted = listener.accept() => accepted?.0,
+        enum Accepted {
+            Socket(tokio::net::TcpStream),
+            Intent(ServiceIntent),
+            OutputHealth,
+        }
+        let accepted = tokio::select! {
+            accepted = listener.accept() => Accepted::Socket(accepted?.0),
+            intent = async {
+                match runtime.as_mut() {
+                    Some((_, receiver)) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => Accepted::Intent(intent.ok_or("service intent channel stopped")?),
             signal = tokio::signal::ctrl_c() => {
                 signal?;
                 println!("Control service stopped. Camera access was not active.");
                 return Ok(());
             }
+            _ = output_health_tick.tick() => {
+                if let Some(worker) = output.as_deref_mut()
+                    && let Err(error) = worker.check_health()
+                    && let Some((state, _)) = runtime.as_ref()
+                {
+                    state.set_output_failed(error);
+                }
+                Accepted::OutputHealth
+            }
         };
-        match run_control_connection(
+        let socket = match accepted {
+            Accepted::Socket(socket) => socket,
+            Accepted::OutputHealth => continue,
+            Accepted::Intent(ServiceIntent::RequestStart { operation_id }) => {
+                if let Some((state, _)) = &runtime {
+                    state.fail(
+                        &operation_id,
+                        "peer_offline",
+                        "trusted phone is not connected",
+                    );
+                }
+                continue;
+            }
+            Accepted::Intent(ServiceIntent::Stop { operation_id }) => {
+                if let Some((state, _)) = &runtime {
+                    state.invalidate_stop();
+                    state.succeed(&operation_id);
+                }
+                continue;
+            }
+            Accepted::Intent(ServiceIntent::ForgetPeer { operation_id }) => {
+                if let Some((state, _)) = &runtime {
+                    state.invalidate_forget();
+                }
+                let result = forget_trust(trust_path);
+                if let Some((state, _)) = &runtime {
+                    match result {
+                        Ok(()) => state.succeed(&operation_id),
+                        Err(error) => state.fail(&operation_id, "forget_failed", error),
+                    }
+                }
+                return Ok(());
+            }
+        };
+        let connection_result = run_control_connection(
             socket,
             acceptor,
             certificate_der,
@@ -167,12 +330,24 @@ async fn run_control_accept_loop(
             trust_path,
             Arc::clone(&listener),
             request_start,
-            output_device,
+            runtime
+                .as_mut()
+                .map(|(state, receiver)| (*state, &mut **receiver)),
+            output.as_deref_mut(),
         )
-        .await
+        .await;
+        if let Some((state, _)) = &runtime
+            && !matches!(connection_result, Ok(ControlConnectionOutcome::ForgotPeer))
         {
+            state.connection_lost();
+        }
+        match connection_result {
             Ok(ControlConnectionOutcome::Disconnected) => {
                 println!("{phone_name} disconnected; waiting for authenticated reconnect.");
+            }
+            Ok(ControlConnectionOutcome::CaptureStopped) => {
+                // This outcome is consumed inside run_control_connection; it
+                // should never escape the authenticated connection loop.
             }
             Ok(ControlConnectionOutcome::ForgotPeer) => {
                 println!("Remote revocation completed; control service is stopping.");
@@ -196,7 +371,8 @@ async fn run_control_connection(
     trust_path: &Path,
     listener: Arc<TcpListener>,
     request_start: bool,
-    output_device: Option<&Path>,
+    mut runtime: Option<(&ServiceRuntime, &mut mpsc::Receiver<ServiceIntent>)>,
+    mut output: Option<&mut capture::OutputWorker>,
 ) -> Result<ControlConnectionOutcome, Box<dyn std::error::Error>> {
     let tls_stream = timeout(CLIENT_STEP_TIMEOUT, acceptor.accept(socket))
         .await
@@ -245,7 +421,17 @@ async fn run_control_connection(
     let mut policy = SessionPolicy::default();
     policy.trust_peer();
     policy.authenticate_connection()?;
-    let request_id = if request_start {
+    if output
+        .as_deref_mut()
+        .is_some_and(capture::OutputWorker::is_healthy)
+    {
+        policy.set_output_ready();
+    }
+    if let Some((state, _)) = &runtime {
+        state.publish_policy(&policy);
+    }
+    let mut request_operation_id = None;
+    let mut request_id = if request_start {
         policy.request_start()?;
         let value = capture::random_identifier::<16>()?;
         write_json_line(
@@ -264,15 +450,114 @@ async fn run_control_connection(
     } else {
         None
     };
+    let mut output_health_tick = tokio::time::interval(std::time::Duration::from_millis(250));
 
     loop {
-        let command = tokio::select! {
-            command = command_rx.recv() => command
-                .ok_or("authenticated control reader stopped")??,
+        enum Next {
+            Phone(ControlCommand),
+            Service(ServiceIntent),
+            OutputHealth,
+        }
+        let next = tokio::select! {
+            command = command_rx.recv() => Next::Phone(command
+                .ok_or("authenticated control reader stopped")??),
+            intent = async {
+                match runtime.as_mut() {
+                    Some((_, receiver)) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => Next::Service(intent.ok_or("service intent channel stopped")?),
             signal = tokio::signal::ctrl_c() => {
                 signal?;
                 return Ok(ControlConnectionOutcome::Shutdown);
             }
+            _ = output_health_tick.tick() => {
+                if let Some(worker) = output.as_deref_mut()
+                    && let Err(error) = worker.check_health()
+                    && let Some((state, _)) = runtime.as_ref()
+                {
+                    state.set_output_failed(error);
+                }
+                Next::OutputHealth
+            }
+        };
+        if matches!(next, Next::OutputHealth) {
+            continue;
+        }
+        if let Next::Service(intent) = next {
+            match intent {
+                ServiceIntent::RequestStart { operation_id } => {
+                    if request_id.is_some() {
+                        if let Some((state, _)) = &runtime {
+                            state.fail(&operation_id, "capture_busy", "another Start is pending");
+                        }
+                        continue;
+                    }
+                    if let Err(error) = policy.request_start() {
+                        if let Some((state, _)) = &runtime {
+                            state.fail(&operation_id, "start_rejected", error.to_string());
+                        }
+                        continue;
+                    }
+                    let value = capture::random_identifier::<16>()?;
+                    write_json_line(
+                        &mut control_write,
+                        &ControlReply::StartRequest {
+                            request_id: URL_SAFE_NO_PAD.encode(value),
+                            desktop_name: hostname_display_name(),
+                            width: 1280,
+                            height: 720,
+                            fps: 30,
+                            codec: "h264-constrained-baseline",
+                        },
+                    )
+                    .await?;
+                    request_id = Some(value);
+                    request_operation_id = Some(operation_id);
+                    if let Some((state, _)) = &runtime {
+                        state.publish_policy(&policy);
+                    }
+                }
+                ServiceIntent::Stop { operation_id } => {
+                    policy.stop();
+                    request_id = None;
+                    request_operation_id = None;
+                    if let Some((state, _)) = &runtime {
+                        state.publish_policy(&policy);
+                        state.succeed(&operation_id);
+                    }
+                    let _ = write_json_line(
+                        &mut control_write,
+                        &ControlReply::StopCapture {
+                            reason: "desktop requested Stop",
+                        },
+                    )
+                    .await;
+                }
+                ServiceIntent::ForgetPeer { operation_id } => {
+                    policy.forget_peer();
+                    if let Some((state, _)) = &runtime {
+                        state.publish_policy(&policy);
+                    }
+                    match forget_trust(trust_path) {
+                        Ok(()) => {
+                            if let Some((state, _)) = &runtime {
+                                state.succeed(&operation_id);
+                            }
+                        }
+                        Err(error) => {
+                            if let Some((state, _)) = &runtime {
+                                state.fail(&operation_id, "forget_failed", error);
+                            }
+                        }
+                    }
+                    return Ok(ControlConnectionOutcome::ForgotPeer);
+                }
+            }
+            continue;
+        }
+        let Next::Phone(command) = next else {
+            unreachable!()
         };
         if !trust_record_matches(trust_path, trusted_public_key) {
             policy.forget_peer();
@@ -300,6 +585,17 @@ async fn run_control_connection(
             } => {
                 capture::require_request_id(request_id, &rejected)?;
                 policy.stop();
+                if let (Some(operation_id), Some((state, _))) =
+                    (request_operation_id.take(), &runtime)
+                {
+                    state.publish_policy(&policy);
+                    state.fail(
+                        &operation_id,
+                        "phone_declined",
+                        "phone declined camera sharing",
+                    );
+                }
+                request_id = None;
                 println!("{phone_name} declined camera sharing. Camera access was not started.");
             }
             ControlCommand::StartApproved {
@@ -307,6 +603,9 @@ async fn run_control_connection(
             } => {
                 capture::require_request_id(request_id, &approved)?;
                 let generation = policy.grant_consent(capture::monotonic_millis())?;
+                if let Some((state, _)) = &runtime {
+                    state.publish_policy(&policy);
+                }
                 let binding = MediaBinding {
                     peer_identity,
                     control_connection_id: connection_id,
@@ -316,6 +615,7 @@ async fn run_control_connection(
                 write_json_line(
                     &mut control_write,
                     &ControlReply::CaptureGranted {
+                        request_id: approved,
                         peer: peer_identity.to_hex(),
                         connection: connection_id.to_hex(),
                         session: binding.media_session_id.to_hex(),
@@ -323,10 +623,8 @@ async fn run_control_connection(
                     },
                 )
                 .await?;
-                let device =
-                    output_device.ok_or("capture was approved without an output device")?;
-                return capture::run_active_capture(
-                    listener,
+                let capture_outcome = capture::run_active_capture(
+                    Arc::clone(&listener),
                     acceptor,
                     certificate_der,
                     trusted_public_key,
@@ -335,9 +633,20 @@ async fn run_control_connection(
                     &mut command_rx,
                     &mut policy,
                     binding,
-                    device,
+                    output.as_deref_mut(),
+                    runtime
+                        .as_mut()
+                        .map(|(state, receiver)| (*state, &mut **receiver)),
+                    request_operation_id.take(),
                 )
                 .await;
+                match capture_outcome? {
+                    ControlConnectionOutcome::CaptureStopped => {
+                        request_id = None;
+                        request_operation_id = None;
+                    }
+                    outcome => return Ok(outcome),
+                }
             }
             ControlCommand::Stop | ControlCommand::MediaOpen { .. } => {
                 policy.stop();
@@ -429,6 +738,7 @@ pub(crate) enum ControlReply {
         codec: &'static str,
     },
     CaptureGranted {
+        request_id: String,
         peer: String,
         connection: String,
         session: String,
@@ -551,6 +861,19 @@ mod tests {
         let mut complete = start_only;
         complete.extend(["--output-device".to_owned(), "/dev/video42".to_owned()]);
         assert!(ControlServeOptions::parse(&complete).is_ok());
+
+        let mut preview_without_capture = base;
+        preview_without_capture.extend([
+            "--preview-socket".to_owned(),
+            "/run/user/1000/omacam/preview.sock".to_owned(),
+        ]);
+        assert!(ControlServeOptions::parse(&preview_without_capture).is_err());
+
+        complete.extend([
+            "--preview-socket".to_owned(),
+            "/run/user/1000/omacam/preview.sock".to_owned(),
+        ]);
+        assert!(ControlServeOptions::parse(&complete).is_ok());
     }
 
     #[test]
@@ -572,5 +895,20 @@ mod tests {
         assert!(PeerIdentity::from_hex(&peer).is_err());
         assert!(ControlConnectionId::from_hex(&connection).is_err());
         assert!(MediaSessionId::from_hex(&media_session).is_err());
+    }
+
+    #[test]
+    fn capture_grant_echoes_the_exact_approved_request() {
+        let reply = ControlReply::CaptureGranted {
+            request_id: "request-token".to_owned(),
+            peer: "11".repeat(32),
+            connection: "22".repeat(16),
+            session: "33".repeat(16),
+            generation: 7,
+        };
+        let encoded = serde_json::to_value(reply).expect("serialize capture grant");
+
+        assert_eq!(encoded["type"], "capture_granted");
+        assert_eq!(encoded["request_id"], "request-token");
     }
 }

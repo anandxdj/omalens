@@ -15,8 +15,130 @@ pub const MEDIA_SESSION_ID_BYTES: usize = 16;
 pub const MEDIA_HEADER_BYTES: usize = 104;
 pub const MAX_H264_ACCESS_UNIT_BYTES: usize = 1_048_576;
 pub const KEY_FRAME_FLAG: u16 = 1;
+/// Binary marker for media records sent to the output worker.
+pub const MEDIA_MAGIC: [u8; 8] = *b"OMACAMM1";
+/// Binary marker for service-scoped output-worker control commands.
+pub const OUTPUT_CONTROL_MAGIC: [u8; 8] = *b"OMACAMO1";
+/// Fixed size of an output-worker bind/reset/shutdown command.
+pub const OUTPUT_CONTROL_HEADER_BYTES: usize = 84;
 
-const MEDIA_MAGIC: [u8; 8] = *b"OMACAMM1";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputControlCommand {
+    Bind(MediaBinding),
+    Reset(MediaBinding),
+    Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputControlError {
+    InvalidMagic,
+    UnsupportedVersion,
+    InvalidKind,
+    InvalidFlags,
+    InvalidBinding,
+}
+
+impl std::fmt::Display for OutputControlError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidMagic => "output control magic is invalid",
+            Self::UnsupportedVersion => "output control protocol version is unsupported",
+            Self::InvalidKind => "output control command kind is invalid",
+            Self::InvalidFlags => "output control flags are invalid",
+            Self::InvalidBinding => "output control binding is invalid",
+        })
+    }
+}
+
+impl std::error::Error for OutputControlError {}
+
+/// Encodes one fixed-size command for the service-scoped output writer.
+///
+/// Bind and Reset carry the complete media binding. Shutdown carries zeroes in
+/// that region. The command is intentionally separate from a media record so a
+/// reset can invalidate one generation without closing the decoder or V4L2
+/// handle.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error when the fixed header cannot be written.
+pub fn write_output_control<W: Write>(
+    writer: &mut W,
+    command: OutputControlCommand,
+) -> Result<(), io::Error> {
+    let mut header = [0_u8; OUTPUT_CONTROL_HEADER_BYTES];
+    header[..8].copy_from_slice(&OUTPUT_CONTROL_MAGIC);
+    header[8] = MEDIA_PROTOCOL_VERSION;
+    header[9] = match command {
+        OutputControlCommand::Bind(_) => 1,
+        OutputControlCommand::Reset(_) => 2,
+        OutputControlCommand::Shutdown => 3,
+    };
+    if let OutputControlCommand::Bind(binding) | OutputControlCommand::Reset(binding) = command {
+        header[12..44].copy_from_slice(binding.peer_identity.as_bytes());
+        header[44..60].copy_from_slice(binding.control_connection_id.as_bytes());
+        header[60..76].copy_from_slice(binding.media_session_id.as_bytes());
+        header[76..84].copy_from_slice(&binding.generation.to_be_bytes());
+    }
+    writer.write_all(&header)
+}
+
+/// Decodes a previously read output-worker control header.
+///
+/// # Errors
+///
+/// Returns an [`OutputControlError`] when the marker, version, fields, or
+/// binding shape is invalid.
+pub fn parse_output_control(
+    header: &[u8; OUTPUT_CONTROL_HEADER_BYTES],
+) -> Result<OutputControlCommand, OutputControlError> {
+    if header[..8] != OUTPUT_CONTROL_MAGIC {
+        return Err(OutputControlError::InvalidMagic);
+    }
+    if header[8] != MEDIA_PROTOCOL_VERSION {
+        return Err(OutputControlError::UnsupportedVersion);
+    }
+    if header[10] != 0 || header[11] != 0 {
+        return Err(OutputControlError::InvalidFlags);
+    }
+    match header[9] {
+        1 | 2 => {
+            let binding = MediaBinding {
+                peer_identity: PeerIdentity::new(
+                    header[12..44]
+                        .try_into()
+                        .map_err(|_| OutputControlError::InvalidBinding)?,
+                ),
+                control_connection_id: ControlConnectionId::new(
+                    header[44..60]
+                        .try_into()
+                        .map_err(|_| OutputControlError::InvalidBinding)?,
+                ),
+                media_session_id: MediaSessionId::new(
+                    header[60..76]
+                        .try_into()
+                        .map_err(|_| OutputControlError::InvalidBinding)?,
+                ),
+                generation: u64::from_be_bytes(
+                    header[76..84]
+                        .try_into()
+                        .map_err(|_| OutputControlError::InvalidBinding)?,
+                ),
+            };
+            if binding.generation == 0 {
+                return Err(OutputControlError::InvalidBinding);
+            }
+            Ok(if header[9] == 1 {
+                OutputControlCommand::Bind(binding)
+            } else {
+                OutputControlCommand::Reset(binding)
+            })
+        }
+        3 if header[12..84].iter().all(|byte| *byte == 0) => Ok(OutputControlCommand::Shutdown),
+        3 => Err(OutputControlError::InvalidBinding),
+        _ => Err(OutputControlError::InvalidKind),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MediaSessionId([u8; MEDIA_SESSION_ID_BYTES]);
@@ -774,6 +896,50 @@ mod tests {
         assert_eq!(
             ControlConnectionId::from_hex("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"),
             Err(MediaError::InvalidConnectionId)
+        );
+    }
+
+    #[test]
+    fn output_control_round_trips_binding_commands_and_shutdown() {
+        let commands = [
+            OutputControlCommand::Bind(BINDING),
+            OutputControlCommand::Reset(BINDING),
+            OutputControlCommand::Shutdown,
+        ];
+        for command in commands {
+            let mut bytes = Vec::new();
+            write_output_control(&mut bytes, command).expect("encode output command");
+            assert_eq!(bytes.len(), OUTPUT_CONTROL_HEADER_BYTES);
+            let header: [u8; OUTPUT_CONTROL_HEADER_BYTES] =
+                bytes.try_into().expect("fixed-size output command");
+            assert_eq!(parse_output_control(&header), Ok(command));
+        }
+    }
+
+    #[test]
+    fn output_control_rejects_wrong_version_flags_and_zero_generation() {
+        let mut bytes = Vec::new();
+        write_output_control(&mut bytes, OutputControlCommand::Bind(BINDING))
+            .expect("encode output command");
+        let mut header: [u8; OUTPUT_CONTROL_HEADER_BYTES] =
+            bytes.try_into().expect("fixed-size output command");
+
+        header[8] = MEDIA_PROTOCOL_VERSION + 1;
+        assert_eq!(
+            parse_output_control(&header),
+            Err(OutputControlError::UnsupportedVersion)
+        );
+        header[8] = MEDIA_PROTOCOL_VERSION;
+        header[10] = 1;
+        assert_eq!(
+            parse_output_control(&header),
+            Err(OutputControlError::InvalidFlags)
+        );
+        header[10] = 0;
+        header[76..84].fill(0);
+        assert_eq!(
+            parse_output_control(&header),
+            Err(OutputControlError::InvalidBinding)
         );
     }
 }

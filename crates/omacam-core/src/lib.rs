@@ -10,21 +10,24 @@ pub mod pairing;
 pub const DEFAULT_CAPTURE_LEASE_MS: u64 = 10_000;
 pub const MAX_FRAME_AGE_MS: u64 = 500;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TrustState {
     Unpaired,
     Trusted,
     Revoked,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConnectionState {
     Offline,
     Online,
     Recovering,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CaptureState {
     Idle,
     AwaitingConsent,
@@ -34,7 +37,8 @@ pub enum CaptureState {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OutputState {
     Missing,
     ReadyNeutral,
@@ -69,7 +73,7 @@ impl std::fmt::Display for PolicyError {
 
 impl std::error::Error for PolicyError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct SessionSnapshot {
     pub trust: TrustState,
     pub connection: ConnectionState,

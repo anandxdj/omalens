@@ -206,6 +206,12 @@ fn find_omacam_labeled_device() -> Option<std::path::PathBuf> {
         })
 }
 
+pub(crate) fn omacam_output_ready() -> bool {
+    find_omacam_labeled_device()
+        .as_deref()
+        .is_some_and(output_writer_ready)
+}
+
 fn output_writer_ready(device: &Path) -> bool {
     let output = Command::new("v4l2-ctl")
         .arg("-d")

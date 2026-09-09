@@ -3,6 +3,7 @@ members = [
   "crates/omacam-core",
   "crates/omacam-daemon",
   "crates/omacam-output",
+  "crates/omacam-preview",
 ]
 resolver = "3"
 

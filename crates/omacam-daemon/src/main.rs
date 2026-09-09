@@ -27,20 +27,28 @@ use tokio_rustls::rustls::pki_types::PrivateKeyDer;
 mod capture;
 mod control_server;
 mod diagnostics;
+mod local_api;
+mod service_runtime;
 
 use control_server::{ControlServeOptions, run_control_server, write_json_line};
 #[cfg(test)]
 use diagnostics::{describe_uvc_candidate, reports_capture_only};
 use diagnostics::{doctor_report, provider_report};
+use local_api::{run_ipc_client, run_service};
 
 const USAGE: &str = "Usage:
   omacam-daemon doctor
   omacam-daemon providers
   omacam-daemon snapshot
+  omacam-daemon service
+  omacam-daemon ipc snapshot
+  omacam-daemon ipc diagnostics
+  omacam-daemon ipc events
+  omacam-daemon ipc start|stop|forget|diagnostics-intent <OPERATION_ID>
   omacam-daemon pair serve --endpoint <LAN_IP:PORT> [--listen <IP:PORT>] [--name <NAME>] [--qr <SVG_PATH>] [--trust <JSON_PATH>] [--identity <JSON_PATH>]
   omacam-daemon pair status [--trust <JSON_PATH>]
   omacam-daemon pair forget [--trust <JSON_PATH>]
-  omacam-daemon control serve --listen <IP:PORT> [--request-start --output-device /dev/videoN] [--trust <JSON_PATH>] [--identity <JSON_PATH>]";
+  omacam-daemon control serve --listen <IP:PORT> [--request-start --output-device /dev/videoN [--preview-socket /owned/runtime/preview.sock]] [--trust <JSON_PATH>] [--identity <JSON_PATH>]";
 const MAX_CONTROL_MESSAGE_BYTES: u64 = 65_536;
 const CLIENT_STEP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PAIRING_FAILURES_PER_SOURCE: u8 = 5;
@@ -62,6 +70,23 @@ async fn main() {
             println!("{:?}", SessionPolicy::default().snapshot());
             0
         }
+        Some("service") => match run_service(&args[1..]).await {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("OmaCam service failed: {error}");
+                1
+            }
+        },
+        Some("ipc") => match run_ipc_client(&args[1..]).await {
+            Ok(output) => {
+                println!("{output}");
+                0
+            }
+            Err(error) => {
+                eprintln!("OmaCam service unavailable: {error}");
+                1
+            }
+        },
         Some("--help" | "-h") => {
             println!("{USAGE}");
             0
