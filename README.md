@@ -11,10 +11,13 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p omacam-daemon -- doctor
 cargo run -p omacam-daemon -- pair status
+cargo run -p omacam-daemon -- service --listen <LAN_IP:PORT> --output-device /dev/videoN
+cargo run -p omacam-daemon -- ipc snapshot
 cargo run -p omacam-output -- --help
+cargo run -p omacam-preview -- --probe
 ```
 
-`omacam-daemon doctor` is read-only. `omacam-output` implements neutral synthetic output plus a development-only framed H.264 ingress and requires an explicitly supplied existing video device; it never creates or selects a device itself. `control serve --request-start --output-device /dev/videoN` requests visible phone consent, then binds the authenticated media channel to the approved peer, connection, session, and generation. This path has not yet been physically qualified.
+`omacam-daemon doctor` is read-only. The user-session `service` owns control/capture state and requires an intentionally selected existing LAN listen address and output device; it does not configure either one. Its D-Bus Start/Stop/Forget/diagnostics intents return operation IDs and expose completion through revisioned snapshots/events. `omacam-output` implements neutral synthetic output plus bounded framed H.264 ingress and never creates or selects a device itself. An optional private `--preview-socket` exposes bounded post-decoder RGBx frames; `omacam-preview` converts that local stream into bounded still frames for the QML panel without another phone stream or H.264 decoder. This path has not yet been physically or live-shell qualified.
 
 The current QR pairing trial is documented in [docs/implementation/G3-001-qr-pairing.md](docs/implementation/G3-001-qr-pairing.md). It establishes trust only; it cannot stream camera media yet.
 

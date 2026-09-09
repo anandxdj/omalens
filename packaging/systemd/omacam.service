@@ -1,0 +1,27 @@
+[Unit]
+Description=OmaCam user camera session
+Documentation=https://example.invalid/omacam
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/omacam/service.conf
+ExecStart=/usr/bin/omacam-daemon service --listen ${OMACAM_LISTEN} --output-device ${OMACAM_OUTPUT_DEVICE} --trust ${STATE_DIRECTORY}/trusted-phone.json --identity ${STATE_DIRECTORY}/desktop-identity.json --preview-socket %t/omacam/preview.sock
+Restart=on-failure
+RestartSec=2s
+RuntimeDirectory=omacam
+RuntimeDirectoryMode=0700
+StateDirectory=omacam
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=graphical-session.target

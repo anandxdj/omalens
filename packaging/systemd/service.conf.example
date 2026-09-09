@@ -1,0 +1,6 @@
+# Copy intentionally to ~/.config/omacam/service.conf after choosing an existing
+# reachable LAN address and the separately provisioned OmaCam-owned V4L2 device.
+# The service only binds/listens and opens this device. It never changes routes,
+# firewall rules, DNS, VPN, USB functions, tethering, or hotspot configuration.
+OMACAM_LISTEN=192.0.2.10:47123
+OMACAM_OUTPUT_DEVICE=/dev/video42

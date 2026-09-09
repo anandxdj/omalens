@@ -1,0 +1,33 @@
+# Prototype only: package identity, licensing, release source, and signing remain open.
+pkgname=omacam-git
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='OmaCam user-session Android webcam bridge prototype'
+arch=('x86_64')
+url='https://example.invalid/omacam'
+license=('custom:UNRESOLVED')
+depends=('gst-plugins-base' 'gst-plugins-bad')
+makedepends=('cargo' 'rust')
+options=('!lto')
+source=()
+sha256sums=()
+
+build() {
+  cd "$startdir/../.."
+  cargo build --release --locked --workspace
+}
+
+package() {
+  cd "$startdir/../.."
+  install -Dm755 target/release/omacam-daemon "$pkgdir/usr/bin/omacam-daemon"
+  install -Dm755 target/release/omacam-output "$pkgdir/usr/bin/omacam-output"
+  install -Dm755 target/release/omacam-preview "$pkgdir/usr/bin/omacam-preview"
+  install -Dm644 packaging/systemd/omacam.service "$pkgdir/usr/lib/systemd/user/omacam.service"
+  install -Dm644 packaging/systemd/service.conf.example "$pkgdir/usr/share/doc/omacam/service.conf.example"
+  install -Dm644 packaging/README.md "$pkgdir/usr/share/doc/omacam/packaging.md"
+  install -d "$pkgdir/usr/share/omacam/omarchy-plugin"
+  cp -a omarchy-plugin/. "$pkgdir/usr/share/omacam/omarchy-plugin/"
+}
+
+# Deliberately no install script and no automatic enable/start. V4L2 provisioning,
+# firewall changes, and shell activation require separate explicit user action.
