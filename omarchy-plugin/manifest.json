@@ -3,7 +3,7 @@
   "id": "dev.omacam",
   "name": "OmaCam",
   "version": "0.1.0",
-  "author": "OmaCam contributors",
+  "author": "Anand and OmaCam contributors",
   "description": "Use an Android phone as an Omarchy camera",
   "kinds": ["bar-widget"],
   "activation": "on-demand",
@@ -18,4 +18,3 @@
     "allowMultiple": false
   }
 }
-

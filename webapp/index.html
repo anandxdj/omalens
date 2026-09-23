@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0a0a0a" />
+    <meta name="color-scheme" content="dark" />
+    <title>OmaCam — Local phone camera</title>
+    <link rel="stylesheet" href="/assets/app.css" />
+  </head>
+  <body>
+    <div class="app-frame">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="OmaCam home">
+          <span class="brand-mark" aria-hidden="true">O</span>
+          <span class="brand-name">OMACAM</span>
+        </a>
+        <div class="topbar-meta">
+          <span class="secure-indicator"><span aria-hidden="true"></span> LOCAL SESSION</span>
+          <label class="accent-control" for="accent-picker">
+            <span>ACCENT</span>
+            <input id="accent-picker" type="color" value="#c7ff00" aria-label="Choose Omarchy accent color" />
+          </label>
+        </div>
+      </header>
+
+      <main id="phone-app" class="phone-app app-view" hidden>
+        <div class="phone-heading">
+          <div>
+            <p class="eyebrow">PHONE CAMERA</p>
+            <h1>Camera link</h1>
+          </div>
+          <p id="phone-status" class="status-pill" role="status" aria-live="polite">Waiting to start</p>
+        </div>
+
+        <section id="phone-main" class="phone-main" aria-label="Phone camera controls">
+          <div class="phone-preview panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">LOCAL PREVIEW</p>
+                <h2>Camera</h2>
+              </div>
+              <span id="phone-format-badge" class="badge">NOT STREAMING</span>
+            </div>
+            <div class="phone-video-frame">
+              <video id="phone-preview-video" autoplay playsinline muted aria-label="Local camera preview"></video>
+              <p id="phone-preview-placeholder" class="preview-placeholder">Preview appears when camera starts</p>
+            </div>
+            <p id="phone-error" class="inline-error" role="alert" hidden></p>
+          </div>
+
+          <div class="panel phone-controls-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">CAPTURE SETUP</p>
+                <h2>Camera controls</h2>
+              </div>
+              <span class="panel-index">01</span>
+            </div>
+            <div class="control-grid">
+              <label class="control-field" id="phone-camera-wrap" for="phone-camera">
+                <span>Camera</span>
+                <select id="phone-camera" autocomplete="off"><option value="">Detecting cameras…</option></select>
+              </label>
+              <label class="control-field" id="phone-format-wrap" for="phone-format">
+                <span>Resolution</span>
+                <select id="phone-format" autocomplete="off"><option value="">Start capture to inspect</option></select>
+              </label>
+              <label class="control-field range-field" id="phone-fps-wrap" for="phone-fps">
+                <span>Frame rate <output id="phone-fps-value">—</output></span>
+                <input id="phone-fps" type="range" min="15" max="60" step="1" value="30" disabled />
+              </label>
+              <label class="control-field range-field" id="phone-zoom-wrap" for="phone-zoom" hidden>
+                <span>Zoom <output id="phone-zoom-value">—</output></span>
+                <input id="phone-zoom" type="range" disabled />
+              </label>
+              <label class="control-field range-field" id="phone-exposure-wrap" for="phone-exposure" hidden>
+                <span>Exposure <output id="phone-exposure-value">—</output></span>
+                <input id="phone-exposure" type="range" disabled />
+              </label>
+            </div>
+            <p id="phone-quality-lock-note" class="control-note" hidden>Resolution and frame rate are fixed for a live stream. Stop, then prepare and start again to change them.</p>
+            <div class="toggle-row">
+              <label class="switch-control" id="phone-torch-wrap" hidden>
+                <input id="phone-torch" type="checkbox" disabled />
+                <span class="switch-track" aria-hidden="true"></span>
+                <span>Torch</span>
+              </label>
+              <label class="switch-control">
+                <input id="phone-mirror" type="checkbox" />
+                <span class="switch-track" aria-hidden="true"></span>
+                <span>Mirror preview</span>
+              </label>
+              <label class="switch-control">
+                <input id="phone-dim" type="checkbox" />
+                <span class="switch-track" aria-hidden="true"></span>
+                <span>Dim screen</span>
+              </label>
+            </div>
+            <div class="phone-actions">
+              <button id="phone-start" class="button button-primary" type="button">Start camera</button>
+              <button id="phone-stop" class="button button-danger" type="button" disabled>Stop camera</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="phone-footnote">
+          <span class="signal-dot" aria-hidden="true"></span>
+          <p>Camera video is sent directly to this local OmaCam session.</p>
+        </section>
+
+        <div id="phone-dim-overlay" class="dim-overlay" hidden>
+          <div class="dim-content">
+            <span class="dim-live-dot" aria-hidden="true"></span>
+            <p class="eyebrow">CAMERA STREAMING</p>
+            <p class="dim-copy">Screen dimmed</p>
+            <div class="dim-actions">
+              <button id="phone-reveal" class="button button-secondary" type="button">Reveal screen</button>
+              <button id="phone-dim-stop" class="button button-danger" type="button">Stop camera</button>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <main id="desktop-app" class="desktop-app app-view" hidden>
+        <div class="desktop-heading">
+          <div>
+            <p class="eyebrow">OMARCHY CONTROL ROOM</p>
+            <h1>Phone camera</h1>
+          </div>
+          <div class="desktop-heading-actions">
+            <p id="desktop-status" class="status-pill" role="status" aria-live="polite">Connecting to session…</p>
+            <button id="desktop-stop" class="button button-danger" type="button" disabled>Stop session</button>
+          </div>
+        </div>
+
+        <section class="desktop-layout" aria-label="Camera control room">
+          <section class="monitor-panel panel" aria-labelledby="monitor-title">
+            <div class="panel-heading monitor-heading">
+              <div>
+                <p class="eyebrow">LIVE MONITOR <span class="monitor-source">/ SHARED DECODE</span></p>
+                <h2 id="monitor-title">Camera feed</h2>
+              </div>
+              <div class="monitor-readouts">
+                <span id="desktop-monitor-state" class="monitor-state"><span aria-hidden="true"></span> NO SIGNAL</span>
+                <span id="desktop-format-badge" class="badge">—</span>
+              </div>
+            </div>
+            <div id="desktop-monitor" class="desktop-monitor">
+              <img id="desktop-preview" alt="Live camera preview from the shared decoder" hidden />
+              <div id="desktop-preview-empty" class="monitor-empty">
+                <div class="monitor-glyph" aria-hidden="true"><span></span><span></span><span></span></div>
+                <p id="desktop-preview-message">Waiting for phone camera</p>
+                <span>Preview is provided by OmaCam’s decoded output</span>
+              </div>
+              <div class="monitor-corner monitor-corner-tl" aria-hidden="true"></div>
+              <div class="monitor-corner monitor-corner-tr" aria-hidden="true"></div>
+              <div class="monitor-corner monitor-corner-bl" aria-hidden="true"></div>
+              <div class="monitor-corner monitor-corner-br" aria-hidden="true"></div>
+            </div>
+            <div class="monitor-footer">
+              <span><i class="signal-dot" aria-hidden="true"></i><span id="desktop-link-label">LOCAL LINK STANDBY</span></span>
+              <span id="desktop-latency-label">FRAME —</span>
+            </div>
+          </section>
+
+          <aside class="desktop-side-rail">
+            <section class="panel control-room-panel" aria-labelledby="control-title">
+              <div class="panel-heading">
+                <div>
+                  <p class="eyebrow">REMOTE CONTROL</p>
+                  <h2 id="control-title">Capture</h2>
+                </div>
+                <span class="panel-index">02</span>
+              </div>
+              <div class="control-stack">
+                <label class="control-field" id="desktop-camera-wrap" for="desktop-camera">
+                  <span>Camera</span>
+                  <select id="desktop-camera" disabled><option value="">Waiting for phone</option></select>
+                </label>
+                <label class="control-field" id="desktop-format-wrap" for="desktop-format">
+                  <span>Resolution</span>
+                  <select id="desktop-format" disabled><option value="">—</option></select>
+                </label>
+                <label class="control-field range-field" id="desktop-fps-wrap" for="desktop-fps">
+                  <span>Frame rate <output id="desktop-fps-value">—</output></span>
+                  <input id="desktop-fps" type="range" min="15" max="60" step="1" value="30" disabled />
+                </label>
+                <label class="control-field range-field" id="desktop-zoom-wrap" for="desktop-zoom" hidden>
+                  <span>Zoom <output id="desktop-zoom-value">—</output></span>
+                  <input id="desktop-zoom" type="range" disabled />
+                </label>
+                <label class="control-field range-field" id="desktop-exposure-wrap" for="desktop-exposure" hidden>
+                  <span>Exposure <output id="desktop-exposure-value">—</output></span>
+                  <input id="desktop-exposure" type="range" disabled />
+                </label>
+              </div>
+              <div class="toggle-row toggle-row-compact">
+                <label class="switch-control" id="desktop-torch-wrap" hidden>
+                  <input id="desktop-torch" type="checkbox" disabled />
+                  <span class="switch-track" aria-hidden="true"></span>
+                  <span>Torch</span>
+                </label>
+                <label class="switch-control" id="desktop-mirror-wrap">
+                  <input id="desktop-mirror" type="checkbox" disabled />
+                  <span class="switch-track" aria-hidden="true"></span>
+                  <span>Mirror</span>
+                </label>
+                <label class="switch-control" id="desktop-dim-wrap" hidden>
+                  <input id="desktop-dim" type="checkbox" disabled />
+                  <span class="switch-track" aria-hidden="true"></span>
+                  <span>Dim phone screen</span>
+                </label>
+              </div>
+              <p id="desktop-command-note" class="control-note" role="status" aria-live="polite">Phone camera capabilities appear when streaming.</p>
+              <p id="desktop-quality-lock-note" class="control-note" hidden>Resolution and frame rate are fixed for this stream. Stop and restart to change them.</p>
+            </section>
+
+            <section class="panel session-panel" aria-labelledby="session-title">
+              <div class="panel-heading">
+                <div>
+                  <p class="eyebrow">SESSION</p>
+                  <h2 id="session-title">Connection</h2>
+                </div>
+                <span class="session-lock" aria-label="Local secure session">LOCKED</span>
+              </div>
+              <dl class="session-readouts">
+                <div><dt>STATE</dt><dd id="desktop-session-state">WAITING</dd></div>
+                <div><dt>REVISION</dt><dd id="desktop-revision">—</dd></div>
+                <div><dt>CAMERA</dt><dd id="desktop-camera-label">—</dd></div>
+              </dl>
+              <p id="desktop-error" class="inline-error" role="alert" hidden></p>
+            </section>
+          </aside>
+        </section>
+        <footer class="desktop-footer">
+          <span>OMACAM / LOCAL CAMERA BRIDGE</span>
+          <span>NO CLOUD RELAY</span>
+        </footer>
+      </main>
+    </div>
+
+    <script type="module" src="/assets/phone.js"></script>
+    <script type="module" src="/assets/desktop.js"></script>
+  </body>
+</html>

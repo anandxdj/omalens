@@ -20,7 +20,9 @@ Panel {
   property var snapshot: null
   property string previewFrame: ""
   property string previewError: ""
-  property int lastRevision: 0
+  property bool previewReceived: false
+  property double lastRevision: 0
+  property double lastEventRevision: 0
   property string actionError: ""
   property string actionName: ""
   property string diagnosticsReport: ""
@@ -36,6 +38,7 @@ Panel {
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property bool serviceReady: snapshot !== null
   readonly property bool outputReady: serviceReady && snapshot.output && snapshot.output.ready === true
+  readonly property string outputState: serviceReady && snapshot.state ? snapshot.state.output : "unknown"
   readonly property string captureState: serviceReady && snapshot.state ? snapshot.state.capture : "unknown"
   readonly property string trustState: serviceReady && snapshot.state ? snapshot.state.trust : "unknown"
   readonly property string connectionState: serviceReady && snapshot.state ? snapshot.state.connection : "unknown"
@@ -43,16 +46,17 @@ Panel {
   readonly property bool stopPending: hasPendingOperation("stop")
   readonly property bool forgetPending: hasPendingOperation("forget_peer")
   readonly property bool lifecycleBusy: startPending || stopPending || forgetPending
-  readonly property bool canStart: serviceReady && !actionRequest.running && !lifecycleBusy
+  readonly property bool canStart: serviceReady && outputReady && !actionRequest.running && !lifecycleBusy
     && trustState === "trusted" && connectionState === "online" && captureState === "idle"
-  readonly property bool canStop: serviceReady && !actionRequest.running
+  readonly property bool canStop: serviceReady && !actionRequest.running && !forgetPending
     && (captureState !== "idle" || startPending)
   readonly property bool canForget: serviceReady && !actionRequest.running
-    && !forgetPending && trustState === "trusted"
+    && !lifecycleBusy && trustState === "trusted"
   readonly property string statusText: {
     if (checking) return "OmaCam — checking service"
     if (!serviceReady) return "OmaCam — service unavailable"
-    if (captureState === "streaming") return "OmaCam — camera sharing"
+    if (captureState === "streaming")
+      return outputReady ? "OmaCam — camera sharing" : "OmaCam — camera output unavailable"
     if (captureState === "awaiting_consent") return "OmaCam — approval needed"
     if (captureState === "starting") return "OmaCam — starting camera"
     if (captureState === "stopping") return "OmaCam — stopping camera"
@@ -62,6 +66,7 @@ Panel {
     if (forgetPending) return "OmaCam — forgetting phone"
     if (trustState !== "trusted") return "OmaCam — pair phone"
     if (connectionState !== "online") return "OmaCam — phone offline"
+    if (outputState === "failed") return "OmaCam — camera output unavailable"
     return outputReady ? "OmaCam — ready" : "OmaCam — setup needed"
   }
 
@@ -94,17 +99,67 @@ Panel {
     }
   }
 
+  function boundedText(value, limit, fallback) {
+    var text = value === undefined || value === null ? "" : String(value)
+    if (text === "") return fallback || ""
+    return text.slice(0, limit)
+  }
+
+  function providerStatus(key) {
+    if (!serviceReady || !snapshot.provider) return "unknown"
+    return boundedText(snapshot.provider[key], 64, "unknown")
+  }
+
+  function providerGuidance() {
+    return "Provider order: already-enabled native UVC (" + providerStatus("native_uvc")
+      + "), qualified browser/PWA (" + providerStatus("browser")
+      + "), then Android companion fallback (" + providerStatus("companion") + ")."
+  }
+
+  function selectedProvider() {
+    if (!serviceReady || !snapshot.provider) return "none"
+    return boundedText(snapshot.provider.selected, 64, "none")
+  }
+
+  function operationErrorText() {
+    if (!snapshot || !snapshot.last_error) return ""
+    var error = snapshot.last_error
+    var code = boundedText(error.error_code, 64, "")
+    var message = boundedText(error.message, 320, "The last operation failed.")
+    return code === "" ? "Last operation failed: " + message
+      : "Last operation failed (" + code + "): " + message
+  }
+
+  function previewIsActive() {
+    return root.opened && root.serviceReady && root.snapshot.preview
+      && root.snapshot.preview.active === true && previewSocket !== ""
+  }
+
+  function stopPreview() {
+    previewRestartTimer.stop()
+    preview.running = false
+    previewFrame = ""
+    previewError = ""
+    previewReceived = false
+  }
+
   onOpenedChanged: {
     if (opened) {
+      // A reopened panel must not render a snapshot from a previous service
+      // instance or revision epoch while the fresh read is in flight.
+      snapshot = null
+      lastRevision = 0
+      lastEventRevision = 0
+      stopPreview()
       startPreview()
       stateEvents.running = true
     }
     else {
-      preview.running = false
+      stopPreview()
       stateEvents.running = false
-      previewFrame = ""
-      previewError = ""
+      diagnosticsRequest.running = false
       forgetArmed = false
+      forgetTimer.stop()
     }
   }
 
@@ -123,9 +178,7 @@ Panel {
   }
 
   function close() {
-    preview.running = false
-    previewFrame = ""
-    previewError = ""
+    stopPreview()
     root.controller.hide()
   }
 
@@ -168,25 +221,29 @@ Panel {
     if (trustState !== "trusted") return "No trusted phone. Pair a supported provider before starting."
     if (connectionState === "recovering") return "Trusted phone disconnected. Reopen the companion to reconnect; camera stays stopped."
     if (connectionState !== "online") return "Trusted phone is offline. Open OmaCam on the phone and choose Find trusted laptop."
-    if (!outputReady) return "Phone is ready, but OmaCam Camera still needs intentional provisioning."
+    if (outputState === "failed") return "OmaCam Camera is unavailable. Review diagnostics; no other camera is changed."
+    if (outputState === "missing") return "Phone is ready, but OmaCam Camera still needs intentional provisioning."
+    if (!outputReady) return "OmaCam Camera is unavailable. Review diagnostics; no other camera is changed."
     return "Ready. Start sends a request; the phone must still approve camera sharing."
   }
 
   function onboardingText() {
     if (!serviceReady)
       return "Install the desktop package, then start its user service when you are ready. Installation must not start it automatically."
+    if (outputState === "failed")
+      return "OmaCam Camera is unavailable. Run read-only diagnostics and repair only an OmaCam-owned output; existing cameras and system settings are never changed. " + providerGuidance()
+    if (outputState === "missing")
+      return "Provision one dedicated OmaCam Camera output, then refresh. Existing cameras and system settings are never changed. " + providerGuidance()
     if (!outputReady)
-      return "Provision one dedicated OmaCam Camera output, then refresh. Existing cameras and system settings are never changed."
+      return "OmaCam Camera is not ready. Run read-only diagnostics before taking any repair action. " + providerGuidance()
     if (trustState !== "trusted") {
-      var provider = snapshot.provider || {}
-      return "Provider check: native UVC " + (provider.native_uvc || "unknown")
-        + "; browser " + (provider.browser || "unknown")
-        + "; companion " + (provider.companion || "unknown")
-        + ". Use the approved companion pairing flow to add a trusted phone; pairing never starts the camera."
+      if (trustState === "revoked")
+        return "Desktop trust was forgotten. If the phone still remembers this laptop, choose Forget laptop there before pairing again. " + providerGuidance()
+      return "No trusted phone. " + providerGuidance() + " Use the approved companion pairing flow to add a trusted phone; pairing never starts the camera."
     }
     if (connectionState !== "online")
       return "Keep both devices on a reachable local network. If connection fails, review firewall access explicitly; OmaCam will not change firewall, routes, DNS, VPN, USB, or hotspot settings."
-    return "In your meeting app, select OmaCam Camera. The meeting app keeps control of its microphone and camera selection."
+    return "Selected provider: " + selectedProvider() + ". In your meeting app, select OmaCam Camera. The meeting app keeps control of its microphone and camera selection."
   }
 
   function moveActionCursor(delta) {
@@ -220,6 +277,11 @@ Panel {
   }
 
   function armOrForget() {
+    if (!canForget) {
+      forgetArmed = false
+      forgetTimer.stop()
+      return
+    }
     if (!forgetArmed) {
       forgetArmed = true
       forgetTimer.restart()
@@ -238,14 +300,16 @@ Panel {
   }
 
   function startPreview() {
-    if (!root.opened || !root.serviceReady || !root.snapshot.preview
-        || root.snapshot.preview.active !== true || previewSocket === "" || preview.running) return
+    if (!previewIsActive() || preview.running) return
     previewError = ""
     preview.running = true
   }
 
   function requestAction(name) {
     if (actionRequest.running) return
+    if (name === "start" && !canStart) return
+    if (name === "stop" && !canStop) return
+    if (name === "forget" && !canForget) return
     actionError = ""
     actionName = name
     var operationId = "panel-" + name + "-" + Date.now()
@@ -260,12 +324,14 @@ Panel {
       waitForEnd: true
       onStreamFinished: {
         var encoded = String(text || "").trim()
-        if (encoded === "") {
+        if (encoded === "" || encoded.length > 65536) {
           root.snapshot = null
-          root.preview.running = false
-          root.previewFrame = ""
-          root.previewError = ""
-          root.checkError = "The OmaCam service returned no snapshot."
+          root.lastRevision = 0
+          root.lastEventRevision = 0
+          root.stopPreview()
+          root.checkError = encoded === ""
+            ? "The OmaCam service returned no snapshot."
+            : "The OmaCam service returned an oversized snapshot."
           return
         }
         try {
@@ -273,17 +339,30 @@ Panel {
           if (!next || next.schema_version !== 2 || next.api_version !== 1)
             throw new Error("unsupported snapshot version")
           var revision = Number(next.revision)
-          if (!Number.isFinite(revision) || revision < 0 || Math.floor(revision) !== revision)
+          if (!Number.isFinite(revision) || revision < 0 || Math.floor(revision) !== revision
+              || revision > 9007199254740991)
             throw new Error("invalid snapshot revision")
-          if (!next.state || !next.output || !next.operations)
+          if (!next.state || typeof next.state.trust !== "string"
+              || typeof next.state.connection !== "string"
+              || typeof next.state.capture !== "string"
+              || typeof next.state.output !== "string"
+              || !next.provider || !next.preview || !next.output
+              || typeof next.output.ready !== "boolean"
+              || typeof next.preview.active !== "boolean"
+              || !Array.isArray(next.operations) || next.operations.length > 32)
             throw new Error("incomplete snapshot")
+          // A restarted user service begins a new revision epoch. The event
+          // stream resets lastRevision before this callback; otherwise a
+          // lower revision is stale and must not regress the visible state.
+          if (root.lastEventRevision > revision && root.lastEventRevision !== 0)
+            throw new Error("snapshot is older than the latest state event")
           root.lastRevision = revision
           root.snapshot = next
           if (next.preview && next.preview.active === true) root.startPreview()
-          else {
-            preview.running = false
-            previewFrame = ""
-            previewError = ""
+          else root.stopPreview()
+          if (root.trustState !== "trusted" || root.forgetPending) {
+            root.forgetArmed = false
+            root.forgetTimer.stop()
           }
           root.ensureActionCursor()
           var trust = next.state && next.state.trust ? next.state.trust : "unknown"
@@ -292,9 +371,9 @@ Panel {
           root.report = "Service online\nTrust: " + trust + "\nConnection: " + connection + "\nCapture: " + capture
         } catch (error) {
           root.snapshot = null
-          root.preview.running = false
-          root.previewFrame = ""
-          root.previewError = ""
+          root.lastRevision = 0
+          root.lastEventRevision = 0
+          root.stopPreview()
           root.checkError = "The OmaCam service returned an invalid snapshot."
         }
       }
@@ -307,9 +386,9 @@ Panel {
       root.checking = false
       if (exitCode !== 0) {
         root.snapshot = null
-        root.preview.running = false
-        root.previewFrame = ""
-        root.previewError = ""
+        root.lastRevision = 0
+        root.lastEventRevision = 0
+        root.stopPreview()
       }
       if (exitCode !== 0 && root.checkError === "")
         root.checkError = "The OmaCam session service is unavailable."
@@ -322,18 +401,29 @@ Panel {
     stdout: SplitParser {
       onRead: function(line) {
         var revision = Number(String(line || "").trim())
-        if (!Number.isFinite(revision)) return
-        // Every event is a refresh hint; a gap explicitly discards incremental assumptions.
-        if (root.lastRevision === 0 || revision > root.lastRevision)
-          root.refresh()
+        if (!Number.isFinite(revision) || revision < 1 || Math.floor(revision) !== revision
+            || revision > 9007199254740991)
+          return
+        if (root.lastEventRevision !== 0 && revision < root.lastEventRevision) {
+          // A service restart resets the local revision epoch. Drop the old
+          // snapshot so a lower revision cannot be rendered as current.
+          root.lastRevision = 0
+          root.snapshot = null
+          root.stopPreview()
+        }
+        if (revision === root.lastEventRevision) return
+        root.lastEventRevision = revision
+        // Events are refresh hints, never incremental state. Any gap, reset,
+        // or newer revision causes a full bounded snapshot fetch.
+        if (root.lastRevision !== revision) root.refresh()
       }
     }
     onExited: function(exitCode) {
       if (root.opened) {
         root.snapshot = null
-        root.preview.running = false
-        root.previewFrame = ""
-        root.previewError = ""
+        root.lastRevision = 0
+        root.lastEventRevision = 0
+        root.stopPreview()
         root.checkError = "State updates ended; refresh restores the full snapshot."
       }
     }
@@ -347,6 +437,7 @@ Panel {
       onStreamFinished: {
         var encoded = String(text || "").trim()
         try {
+          if (encoded.length > 65536) throw new Error("oversized diagnostics")
           var result = JSON.parse(encoded)
           if (!result || result.schema_version !== 2) throw new Error("unsupported diagnostics")
           var boundedHost = String(result.host || "").slice(0, 6000)
@@ -372,6 +463,13 @@ Panel {
   }
 
   Timer {
+    id: previewRestartTimer
+    interval: 1000
+    repeat: false
+    onTriggered: root.startPreview()
+  }
+
+  Timer {
     interval: 5000
     running: root.opened
     repeat: true
@@ -387,9 +485,14 @@ Panel {
     stdout: SplitParser {
       onRead: function(line) {
         var frame = String(line || "").trim()
-        if (!root.opened || frame.length === 0 || frame.length > 350000) return
+        // The helper emits STANDARD base64 for JPEGs capped at 256 KiB.
+        // Reject malformed or oversized lines before handing them to QML's
+        // image decoder, keeping preview input bounded and non-networked.
+        if (!root.opened || frame.length < 8 || frame.length > 349528
+            || frame.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(frame)) return
         if (previewImage.status !== Image.Loading) {
           root.previewFrame = frame
+          root.previewReceived = true
           root.previewError = ""
         }
       }
@@ -402,6 +505,9 @@ Panel {
       if (root.opened && exitCode !== 0 && root.previewError === "")
         root.previewError = "Preview is unavailable. Camera output is unaffected."
       root.previewFrame = ""
+      root.previewReceived = false
+      if (root.opened && root.previewIsActive() && exitCode === 0)
+        previewRestartTimer.restart()
     }
   }
 
@@ -487,19 +593,33 @@ Panel {
             asynchronous: true
             cache: false
             visible: root.previewFrame !== ""
+            Accessible.role: Accessible.Graphic
+            Accessible.name: root.previewFrame === "" ? "No camera preview" : "OmaCam camera preview"
+            Accessible.description: "Bounded local preview from the same decoded source as OmaCam Camera"
+            Accessible.ignored: root.previewFrame === ""
+            onStatusChanged: {
+              if (status === Image.Error && root.opened)
+                root.previewError = "The preview frame could not be decoded. Camera output is unaffected."
+            }
           }
 
           Text {
             anchors.centerIn: parent
             width: parent.width - Style.space(64)
-            text: root.checking ? "Checking OmaCam service…" : (!root.serviceReady ? "OmaCam service unavailable" : (root.outputReady ? "Camera output ready" : "Camera setup needed"))
+            text: root.checking ? "Checking OmaCam service…"
+              : (!root.serviceReady ? "OmaCam service unavailable"
+                : (root.previewError !== "" ? "Preview unavailable; camera output unaffected"
+                  : (root.outputState === "missing" ? "Camera setup needed"
+                    : (root.outputReady ? "Camera output ready" : "Camera output unavailable"))))
             horizontalAlignment: Text.AlignHCenter
             wrapMode: Text.WordWrap
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.title
             font.bold: true
-            visible: root.previewFrame === ""
+            visible: root.previewFrame === "" || previewImage.status === Image.Error
+            Accessible.role: Accessible.StaticText
+            Accessible.name: text
           }
 
           Repeater {
@@ -556,6 +676,8 @@ Panel {
             Accessible.role: Accessible.Button
             Accessible.name: "Start camera sharing request"
             Accessible.description: "Requires approval on the trusted phone"
+            Accessible.onPressAction: root.requestAction("start")
+            onHovered: function(isHovered) { if (isHovered) root.actionCursor = 0 }
             onClicked: root.requestAction("start")
           }
 
@@ -569,6 +691,9 @@ Panel {
             hasCursor: keyCatcher.activeFocus && root.actionCursor === 1
             Accessible.role: Accessible.Button
             Accessible.name: "Stop camera sharing"
+            Accessible.description: "Invalidates capture before cleanup and clears old camera frames"
+            Accessible.onPressAction: root.requestAction("stop")
+            onHovered: function(isHovered) { if (isHovered) root.actionCursor = 1 }
             onClicked: root.requestAction("stop")
           }
 
@@ -583,6 +708,9 @@ Panel {
             hasCursor: keyCatcher.activeFocus && root.actionCursor === 2
             Accessible.role: Accessible.Button
             Accessible.name: root.forgetArmed ? "Confirm forgetting trusted phone" : "Forget trusted phone"
+            Accessible.description: "Requires a second activation; revokes desktop trust and stops sharing"
+            Accessible.onPressAction: root.armOrForget()
+            onHovered: function(isHovered) { if (isHovered) root.actionCursor = 2 }
             onClicked: root.armOrForget()
           }
 
@@ -595,6 +723,9 @@ Panel {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
+            Accessible.role: Accessible.StatusBar
+            Accessible.name: root.stateSummary()
+            Accessible.description: "Current OmaCam trust, connection, capture, and output status"
           }
         }
 
@@ -621,6 +752,9 @@ Panel {
             hasCursor: keyCatcher.activeFocus && root.actionCursor === 3
             Accessible.role: Accessible.Button
             Accessible.name: "Refresh OmaCam state"
+            Accessible.description: "Reads a bounded service snapshot without changing system settings"
+            Accessible.onPressAction: root.refresh()
+            onHovered: function(isHovered) { if (isHovered) root.actionCursor = 3 }
             onClicked: root.refresh()
           }
 
@@ -633,6 +767,9 @@ Panel {
             hasCursor: keyCatcher.activeFocus && root.actionCursor === 4
             Accessible.role: Accessible.Button
             Accessible.name: root.diagnosticsExpanded ? "Hide diagnostics" : "Show diagnostics"
+            Accessible.description: "Runs read-only diagnostics without exporting camera frames or secrets"
+            Accessible.onPressAction: root.toggleDiagnostics()
+            onHovered: function(isHovered) { if (isHovered) root.actionCursor = 4 }
             onClicked: root.toggleDiagnostics()
           }
 
@@ -658,6 +795,8 @@ Panel {
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           wrapMode: Text.WrapAnywhere
+          Accessible.role: Accessible.StaticText
+          Accessible.name: text
         }
 
         Text {
@@ -669,13 +808,15 @@ Panel {
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           wrapMode: Text.WordWrap
+          Accessible.role: Accessible.AlertMessage
+          Accessible.name: text
         }
 
         Text {
           width: parent.width
           text: root.actionError !== "" ? root.actionError
-            : (root.snapshot && root.snapshot.last_error && root.snapshot.last_error.message
-              ? "Last operation failed: " + root.snapshot.last_error.message
+            : (root.operationErrorText() !== ""
+              ? root.operationErrorText()
               : (root.checkError !== "" ? root.checkError : root.report))
           textFormat: Text.PlainText
           color: (root.checkError !== "" || root.actionError !== "" || (root.snapshot && root.snapshot.last_error))
@@ -683,6 +824,8 @@ Panel {
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           wrapMode: Text.WrapAnywhere
+          Accessible.role: Accessible.StaticText
+          Accessible.name: text
         }
       }
     }

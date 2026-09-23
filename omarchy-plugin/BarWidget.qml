@@ -61,6 +61,7 @@ BarWidget {
     Accessible.role: Accessible.Button
     Accessible.name: "OmaCam camera panel"
     Accessible.description: panelLoader.item ? panelLoader.item.statusText : "Open OmaCam"
+    Accessible.onPressAction: root.togglePanel()
     onPressed: function(button) {
       if (button === Qt.LeftButton) root.togglePanel()
     }
