@@ -28,3 +28,11 @@ invalid redundant `gst-plugin-openh264` package dependency on this host, where
 the OpenH264 plugin is owned by `gst-plugins-bad`. Release name, URL, license,
 source/provenance, maintainer ownership, and signing identity also remain user
 decisions.
+
+## Resumed-session disposition
+
+The output ownership defect and invalid package dependency described above
+were addressed in the resumed 2026-09-09 integration session. Automated
+verification and remaining evidence boundaries are recorded in G5-004 and at
+the top of `NEXT-SESSION.md`. This historical interrupted-session record is
+retained so its earlier evidence is not mistaken for the later rerun.

@@ -1,12 +1,12 @@
-# Prototype only: package identity, licensing, release source, and signing remain open.
 pkgname=omacam-git
 pkgver=0.1.0
 pkgrel=1
-pkgdesc='OmaCam user-session Android webcam bridge prototype'
+pkgdesc='Omarchy-first Android webcam bridge'
 arch=('x86_64')
-url='https://example.invalid/omacam'
-license=('custom:UNRESOLVED')
-depends=('gst-plugins-base' 'gst-plugins-bad')
+url='https://github.com/anandxdj/omalens'
+license=('MIT')
+depends=('gst-plugins-base' 'gst-plugins-bad' 'gst-plugins-good' 'v4l-utils')
+optdepends=('v4l2loopback-dkms: dedicated virtual camera output device')
 makedepends=('cargo' 'rust')
 options=('!lto')
 source=()
@@ -25,6 +25,7 @@ package() {
   install -Dm644 packaging/systemd/omacam.service "$pkgdir/usr/lib/systemd/user/omacam.service"
   install -Dm644 packaging/systemd/service.conf.example "$pkgdir/usr/share/doc/omacam/service.conf.example"
   install -Dm644 packaging/README.md "$pkgdir/usr/share/doc/omacam/packaging.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -d "$pkgdir/usr/share/omacam/omarchy-plugin"
   cp -a omarchy-plugin/. "$pkgdir/usr/share/omacam/omarchy-plugin/"
 }

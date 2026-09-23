@@ -1,9 +1,10 @@
 # Packaging and installation status
 
-The files in this directory describe a local Arch package prototype. They are
-deliberately not a publishable release: the final package name, project URL,
-license, source archive, maintainer ownership, and signing identity have not
-been chosen. `PKGBUILD` therefore builds only from this repository checkout.
+The files in this directory build the OmaCam 0.1 release candidate from the
+current repository checkout. The package has an MIT license and canonical
+project URL, but it must not be published until a version tag is created, a
+source archive checksum is pinned, and the package and Android APK are signed
+by keys controlled by the release owner.
 
 The package installs three fixed-purpose binaries, the user unit, one example
 configuration, and the OmaCam shell plugin under `/usr/share/omacam`. It has no
@@ -13,9 +14,8 @@ Omarchy configuration.
 
 After a package is installed, the user must intentionally:
 
-1. Provision a dedicated, package-owned `v4l2loopback` device according to the
-   eventual distribution policy. Do not select an existing camera by label or
-   path alone.
+1. Provision a dedicated, OmaCam-owned `v4l2loopback` device. Do not select an
+   existing camera by label or path alone.
 2. Copy `service.conf.example` to `~/.config/omacam/service.conf`, replace both
    documentation-only values with an existing reachable LAN address and the
    verified dedicated output node, and restrict the file to the user.

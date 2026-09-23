@@ -1,5 +1,13 @@
 # G5-002 — Service-owned lifecycle intents and revisioned state
 
+## 2026-09-09 resumed verification
+
+G5-004 supersedes this record's former connection-scoped output limitation.
+The service now owns the neutral raw writer for its lifetime and controls one
+generation-bound decoder through bounded reset/rebind commands. The complete
+83-test Rust matrix and D-Bus intent/failure smoke are recorded there. Physical
+consumer-handle and OmaCam-owned V4L2 evidence remains open.
+
 Status: implemented and automated/synthetic verified on 2026-09-09. Physical phone, live-shell, real V4L2 application, installation, release packaging, and signing evidence remain open. This does not complete G2, G3, G4, G5, the MVP, or the product.
 
 Requirements: R01, R02, R05, R09–R11, R13, R17–R20. Gates: foundation toward G2/G5; no gate is complete.

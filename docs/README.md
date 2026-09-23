@@ -18,6 +18,7 @@ OmaCam turns one Android phone into one Linux webcam without changing existing n
 | [Verification and release](07-verification-and-release.md) | Acceptance matrix, measurement methods, packaging, recovery, and release gates |
 | [LLM implementation guide](08-llm-implementation-guide.md) | Working rules, code standards, task format, and handoff instructions |
 | [Decisions and sources](09-decisions-and-sources.md) | Proposed decisions, unresolved questions, and verifiable references |
+| [Completion plan](implementation/COMPLETION-PLAN.md) | Executable checklist for physical camera, live Omarchy UI, controls, reliability, packaging, and release evidence |
 
 ## How to interpret these documents
 

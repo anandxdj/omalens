@@ -1,5 +1,19 @@
 # G4-005 — Android callback and acquisition fault injection
 
+## 2026-09-09 resumed verification
+
+The resumed integration added a bounded `MediaCodecOutput` copy boundary and
+closed a Start/Stop race by publishing and starting the streamer under the
+capture lifecycle lock while generation-gating terminal callbacks. The
+coordinator reran the full JDK-17 matrix: 32 JVM tests passed with zero
+failures/errors; debug, instrumentation-test APK, unsigned release APK,
+`lintDebug`, and `lintRelease` all built in 126 executed Gradle actions. Debug
+APK v2 signing verified with one debug signer, and compiled permissions contain
+CAMERA, INTERNET, multicast/network state, and no RECORD_AUDIO. `adb devices
+-l` returned no devices, so connected instrumentation and physical framework,
+permission, camera-busy, codec-failure, Stop/restart, and revocation evidence
+remain open.
+
 Status: implemented and JVM/build/static verified on 2026-09-09 without a phone. A four-test Android instrumentation suite is compiled and ready to run, but `adb devices -l` reported no device/emulator, so no instrumented-device or physical-camera test was executed. Camera2 and MediaCodec behavior is fault-injected at the application boundary. This does not complete G3, G4, the MVP, or the product.
 
 Requirements: R05, R09–R11, R13, R20. Gate: partial G4.

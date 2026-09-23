@@ -9,3 +9,6 @@
 /packaging/arch/src/
 *.pkg.tar.zst
 *.pkg.tar.zst.sig
+.playwright-cli/
+__pycache__/
+*.py[cod]

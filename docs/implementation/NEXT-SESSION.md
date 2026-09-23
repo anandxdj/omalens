@@ -1,5 +1,41 @@
 # OmaCam implementation handoff
 
+## 2026-09-10 Physical Streaming Qualification & Decoder Green-Screen Fix
+
+- **Root Cause & Resolution:** Fixed the static green screen on `/dev/video42` during live capture. `omacam-output`'s `build_decoder_command()` contained `videorate drop-only=true` with fixed 30 fps caps. Because Android MediaCodec outputs variable-rate H.264 streams (`framerate=0/1`), `videorate` dropped 100% of decoded video frames, leaving the video sink on uninitialized green YUV memory. Removing `videorate` from the decoder allows all frames to pass directly into `RawMux` (which already owns the fixed 30 fps output ticker).
+- **Physical Verification:** Verified with a physical OnePlus Nord 4 (`CPH2661`, Android 16 API 36). Ran `./scripts/start-camera.sh --pair`, scanned the QR code, accepted camera capture permission on the phone, and observed real-time 720p30 video playback in `ffplay` on `/dev/video42`. A visual screenshot was captured and verified.
+- **Test Status:** All 83 workspace Rust unit/integration tests pass cleanly (`cargo test --workspace`).
+- **Runner Script:** Added `./scripts/start-camera.sh` with single-command startup, automatic LAN IP resolution, optional `--pair`/`--fresh` QR re-pairing, mDNS publication, and automated IPC start triggering.
+
+## 2026-09-09 resumed integration handoff
+
+The primary service-output architecture gate is now implemented and passes
+automated regression coverage. `G5-004-service-output-integration.md` is the
+authoritative record for the service-lifetime neutral writer, persistent
+consumer boundary, bounded reset/rebind protocol, one-decoder invariant,
+freshness-biased queues, stale-generation rejection, D-Bus behavior, and exact
+coordinator evidence. This supersedes the architecture defect described in the
+older stop handoff below; it does not close physical G4/G5 product gates.
+
+Current verified counts are 83 Rust tests (39/23/17/4) and 32 Android JVM
+tests. The complete Rust format/check/test/strict-Clippy/release matrix,
+Android JVM/debug/instrumentation-APK/release/lint matrix, release output and
+preview probes, constrained 720p30 H.264 normalization, QML lint, D-Bus
+snapshot/event/rejection/idempotency/failure smoke, clean package build,
+archive inspection, and isolated 11-assertion package lifecycle passed.
+
+Open evidence is precise: `adb devices -l` was empty, so run the requested
+JDK-17 `connectedDebugAndroidTest` command when a device/emulator exists and
+then perform the physical Camera2/codec/permission/busy/revocation matrix. Use
+only a proven OmaCam-owned V4L2 node for consumer persistence, recognizable
+imagery, Stop-to-neutral, and sustained application trials. With explicit
+authorization, run the repository plugin in a controlled live shell and test
+preview reopen/event-loss behavior. Isolated systemd verification now passes
+with the explicit root-relative user-unit search path recorded in the packaging
+report. Rootful pacman lifecycle, release identity/provenance/license, and
+signing remain unresolved. Preserve
+the dirty tree and do not touch shared video nodes or live system settings.
+
 ## 2026-09-09 coordinated-session stop handoff
 
 The user stopped the multi-agent run to conserve tokens. All agents were
