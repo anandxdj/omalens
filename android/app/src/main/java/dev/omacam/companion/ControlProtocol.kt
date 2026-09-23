@@ -7,6 +7,11 @@ internal sealed interface ControlResponse {
     data class Pong(val captureAuthorized: Boolean) : ControlResponse
     data class StartRequest(val requestId: String, val desktopName: String) : ControlResponse
     data class CaptureGranted(val requestId: String, val binding: CaptureBinding) : ControlResponse
+    data class CameraControl(
+        val commandId: String,
+        val generation: Long,
+        val controls: JSONObject,
+    ) : ControlResponse
     data class Stopped(val reason: String) : ControlResponse
     data class StopCapture(val reason: String) : ControlResponse
     data object Forgotten : ControlResponse
@@ -83,6 +88,25 @@ internal object ControlProtocol {
                     requestId,
                     CaptureBinding(peer, connection, session, generation),
                 )
+            }
+            "camera_control" -> {
+                requireKeys(json, "type", "command_id", "generation", "controls")
+                val commandId = json.getString("command_id")
+                require(commandId.isNotBlank() && commandId.toByteArray().size <= 128) {
+                    "Camera command identifier is invalid"
+                }
+                val generation = json.getLong("generation")
+                require(generation > 0) { "Camera generation is invalid" }
+                val controls = json.getJSONObject("controls")
+                val supported = setOf(
+                    "cameraId", "width", "height", "fps", "zoom", "exposure", "torch",
+                    "previewMirrored", "screenDimmed", "stop",
+                )
+                require(controls.keys().asSequence().all { it in supported }) {
+                    "Camera control fields are not recognized"
+                }
+                require(controls.length() in 1..supported.size) { "Camera controls are empty" }
+                ControlResponse.CameraControl(commandId, generation, controls)
             }
             "stopped" -> {
                 requireKeys(json, "type", "reason")

@@ -24,7 +24,10 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.charset.StandardCharsets
 import java.time.Instant
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocket
 
@@ -38,7 +41,10 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var activeSocket: Socket? = null
     @Volatile private var activeControlOutput: BufferedOutputStream? = null
     @Volatile private var cameraStreamer: CameraStreamer? = null
+    @Volatile private var originalScreenBrightness: Float? = null
     private val capturePolicy = CaptureSessionPolicy()
+    /** Serializes policy invalidation with publication/start of a new streamer. */
+    private val captureLifecycleLock = Any()
     @Volatile private var resolvingService = false
     private var pendingClaim: PreparedClaim? = null
     private var pendingStart: ControlResponse.StartRequest? = null
@@ -78,10 +84,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
-        if (cameraStreamer != null ||
-            (capturePolicy.phase() != CaptureSessionPolicy.Phase.Idle &&
-                !cameraPermissionRequestInFlight)
-        ) {
+        val captureNeedsStopping = synchronized(captureLifecycleLock) {
+            cameraStreamer != null ||
+                (capturePolicy.phase() != CaptureSessionPolicy.Phase.Idle &&
+                    !cameraPermissionRequestInFlight)
+        }
+        if (captureNeedsStopping) {
             stopCapture("OmaCam left the foreground")
         }
         super.onPause()
@@ -409,6 +417,14 @@ class MainActivity : AppCompatActivity() {
             }
             is ControlResponse.StartRequest -> runOnUiThread { showStartRequest(response) }
             is ControlResponse.CaptureGranted -> startCapture(response.requestId, response.binding)
+            is ControlResponse.CameraControl -> {
+                val streamer = cameraStreamer
+                if (streamer == null) {
+                    stopCapture("Camera control arrived without an active capture")
+                } else {
+                    streamer.applyControls(response.commandId, response.generation, response.controls)
+                }
+            }
             is ControlResponse.Stopped -> {
                 stopCapture(response.reason)
                 activeTrustedDesktop?.let { trusted ->
@@ -441,7 +457,17 @@ class MainActivity : AppCompatActivity() {
                 approveStart(request)
             } else {
                 cameraPermissionRequestInFlight = true
-                cameraPermission.launch(Manifest.permission.CAMERA)
+                primary.isEnabled = false
+                secondary.isEnabled = false
+                try {
+                    cameraPermission.launch(Manifest.permission.CAMERA)
+                } catch (error: Exception) {
+                    // A lifecycle transition or a duplicate tap can reject an
+                    // Activity Result launch. Do not leave authorization armed
+                    // with a permanently disabled consent UI.
+                    cameraPermissionRequestInFlight = false
+                    rejectStart(request, "Camera permission request failed: ${error.message}")
+                }
             }
         }
         secondary.visibility = View.VISIBLE
@@ -470,46 +496,77 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startCapture(requestId: String, binding: CaptureBinding) {
-        require(cameraStreamer == null) { "A capture pipeline is already active" }
-        capturePolicy.grant(requestId, binding)
         val trusted = activeTrustedDesktop ?: error("Trusted desktop context is unavailable")
         val endpoint = activeEndpoint ?: error("Desktop endpoint is unavailable")
         lateinit var streamer: CameraStreamer
-        streamer = CameraStreamer(this, trusted.certificateSha256, endpoint, binding) { reason ->
-            if (cameraStreamer === streamer) {
-                capturePolicy.stop()
-                cameraStreamer = null
-                runOnUiThread {
-                    if (!isDestroyed && cameraStreamer == null &&
-                        capturePolicy.phase() == CaptureSessionPolicy.Phase.Idle
-                    ) {
-                        showConnected(trusted, getString(R.string.capture_ended, reason))
+        synchronized(captureLifecycleLock) {
+            require(cameraStreamer == null) { "A capture pipeline is already active" }
+            capturePolicy.grant(requestId, binding)
+            streamer = CameraStreamer(
+                this,
+                trusted.certificateSha256,
+                endpoint,
+                binding,
+                onCameraState = ::sendCameraState,
+                onScreenDimChange = ::setScreenDimmed,
+                onStopped = { reason ->
+                    val stopped = synchronized(captureLifecycleLock) {
+                        if (cameraStreamer !== streamer) {
+                            false
+                        } else {
+                            capturePolicy.stop()
+                            cameraStreamer = null
+                            true
+                        }
                     }
-                }
+                    setScreenDimmed(false)
+                    if (stopped) {
+                        runOnUiThread {
+                            if (!isDestroyed && cameraStreamer == null &&
+                                capturePolicy.phase() == CaptureSessionPolicy.Phase.Idle
+                            ) {
+                                showConnected(trusted, getString(R.string.capture_ended, reason))
+                            }
+                        }
+                    }
+                },
+            )
+            // Publish and start under one lock. Otherwise onPause or the Stop
+            // button can observe a Streaming policy before the thread starts,
+            // invalidate it, and then be followed by an unauthorized start.
+            cameraStreamer = streamer
+            streamer.start()
+        }
+        runOnUiThread {
+            // A codec/camera failure can finish the worker before this UI
+            // runnable executes. Do not let that stale runnable announce a
+            // stream after the callback has already returned to Idle.
+            if (!isDestroyed && cameraStreamer === streamer &&
+                capturePolicy.phase() is CaptureSessionPolicy.Phase.Streaming
+            ) {
+                title.text = getString(R.string.sharing_with, trusted.name)
+                details.setText(R.string.camera_live)
+                primary.visibility = View.VISIBLE
+                primary.isEnabled = true
+                primary.setText(R.string.stop_camera)
+                primary.setOnClickListener { stopCapture("Stopped on phone") }
+                secondary.visibility = View.GONE
             }
         }
-        cameraStreamer = streamer
-        runOnUiThread {
-            title.text = getString(R.string.sharing_with, trusted.name)
-            details.setText(R.string.camera_live)
-            primary.visibility = View.VISIBLE
-            primary.isEnabled = true
-            primary.setText(R.string.stop_camera)
-            primary.setOnClickListener { stopCapture("Stopped on phone") }
-            secondary.visibility = View.GONE
-        }
-        streamer.start()
     }
 
     private fun stopCapture(reason: String) {
-        val previous = capturePolicy.stop()
-        pendingStart = null
-        cameraPermissionRequestInFlight = false
-        val streamer = cameraStreamer
-        cameraStreamer = null
+        val (previous, streamer, trusted) = synchronized(captureLifecycleLock) {
+            val previous = capturePolicy.stop()
+            pendingStart = null
+            cameraPermissionRequestInFlight = false
+            val streamer = cameraStreamer
+            cameraStreamer = null
+            Triple(previous, streamer, activeTrustedDesktop)
+        }
         streamer?.stop(reason)
+        setScreenDimmed(false)
         if (previous != CaptureSessionPolicy.Phase.Idle) sendControlCommand("stop")
-        val trusted = activeTrustedDesktop
         runOnUiThread {
             if (!isDestroyed && trusted != null) showConnected(trusted, getString(R.string.capture_ended, reason))
         }
@@ -535,6 +592,58 @@ class MainActivity : AppCompatActivity() {
             }
         } catch (_: Exception) {
             // Local Stop/Forget still takes effect if the peer is unreachable.
+        }
+    }
+
+    private fun sendCameraState(state: JSONObject) {
+        val output = activeControlOutput ?: return
+        try {
+            synchronized(output) {
+                output.write(state.toString().toByteArray(StandardCharsets.UTF_8))
+                output.write('\n'.code)
+                output.flush()
+            }
+        } catch (_: Exception) {
+            // The regular control lease will stop capture if this TLS path is lost.
+        }
+    }
+
+    /** Applies only a per-window brightness override and restores the exact prior value. */
+    private fun setScreenDimmed(dimmed: Boolean): Boolean {
+        val completed = CountDownLatch(1)
+        val applied = AtomicBoolean(false)
+        val cancelled = AtomicBoolean(false)
+        runOnUiThread {
+            try {
+                if (!cancelled.get()) {
+                    val original = originalScreenBrightness
+                    if (dimmed && original == null) {
+                        originalScreenBrightness = window.attributes.screenBrightness
+                    }
+                    val restore = originalScreenBrightness
+                    if (dimmed || restore != null) {
+                        val attributes = window.attributes
+                        attributes.screenBrightness = if (dimmed) 0.15f else restore ?: attributes.screenBrightness
+                        window.attributes = attributes
+                        if (!dimmed) originalScreenBrightness = null
+                    }
+                    applied.set(true)
+                }
+            } catch (_: Exception) {
+                applied.set(false)
+            } finally {
+                completed.countDown()
+            }
+        }
+        return try {
+            if (completed.await(2, TimeUnit.SECONDS)) applied.get() else {
+                cancelled.set(true)
+                false
+            }
+        } catch (_: InterruptedException) {
+            cancelled.set(true)
+            Thread.currentThread().interrupt()
+            false
         }
     }
 

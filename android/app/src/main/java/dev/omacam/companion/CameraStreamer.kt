@@ -7,6 +7,9 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
+import android.graphics.Rect
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
@@ -28,6 +31,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.roundToInt
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocket
 
@@ -37,6 +41,8 @@ internal class CameraStreamer(
     private val trustedCertificate: String,
     private val endpoint: Endpoint,
     private val binding: CaptureBinding,
+    private val onCameraState: (JSONObject) -> Unit,
+    private val onScreenDimChange: (Boolean) -> Boolean,
     private val onStopped: (String) -> Unit,
 ) {
     private val active = AtomicBoolean(false)
@@ -53,6 +59,384 @@ internal class CameraStreamer(
     @Volatile private var encoder: MediaCodec? = null
     @Volatile private var encoderSurface: Surface? = null
     @Volatile private var cameraThread: HandlerThread? = null
+    @Volatile private var cameraHandler: Handler? = null
+    private var requestBuilder: CaptureRequest.Builder? = null
+    private var selectedId = ""
+    private var characteristics: CameraCharacteristics? = null
+    private var supportedCameras: List<SupportedCamera> = emptyList()
+    private var pendingCommand: String? = null
+    private var pendingControls: JSONObject? = null
+    private var statePublished = false
+    private var screenDimmed = false
+    private var appliedState = JSONObject()
+
+    /** Commands are serialized onto Camera2; only capture results acknowledge application. */
+    fun applyControls(commandId: String, generation: Long, controls: JSONObject) {
+        val handler = cameraHandler ?: return
+        handler.post {
+            if (!active.get() || generation != binding.generation) return@post
+            if (pendingCommand != null) {
+                publishState(commandId, "A camera adjustment is still pending")
+                return@post
+            }
+            try {
+                val allowed = setOf(
+                    "zoom", "exposure", "torch", "cameraId", "width", "height", "fps",
+                    "stop", "previewMirrored", "screenDimmed",
+                )
+                require(controls.keys().asSequence().all { it in allowed }) { "Unknown camera control" }
+                require(!controls.hasValue("cameraId") || supportedCameras.any { it.id == controls.getString("cameraId") }) {
+                    "Camera does not support the native 720p30 output"
+                }
+                require(!controls.hasValue("width") || controls.getInt("width") == TARGET_SIZE.width) {
+                    "This native output supports 720p30"
+                }
+                require(!controls.hasValue("height") || controls.getInt("height") == TARGET_SIZE.height) {
+                    "This native output supports 720p30"
+                }
+                require(!controls.hasValue("fps") || controls.getDouble("fps") == TARGET_FPS.toDouble()) {
+                    "This native output supports 720p30"
+                }
+                require(!controls.hasValue("previewMirrored")) { "Native companion has no preview to mirror" }
+                require(!controls.optBoolean("stop", false)) { "Stop must use the session Stop action" }
+                val selected = supportedCameras.firstOrNull {
+                    it.id == controls.optString("cameraId", selectedId)
+                } ?: error("Camera is not available")
+                if (selected.id != selectedId) {
+                    switchCamera(selected, commandId, controls)
+                } else {
+                    applyCurrentCameraControls(commandId, controls)
+                }
+            } catch (error: Exception) {
+                pendingCommand = null
+                pendingControls = null
+                publishState(commandId, error.message ?: "Camera adjustment rejected")
+            }
+        }
+    }
+
+    private fun applyCurrentCameraControls(commandId: String, controls: JSONObject) {
+        val handler = cameraHandler ?: error("Camera handler is unavailable")
+        val chars = characteristics ?: error("Camera capabilities unavailable")
+        val builder = requestBuilder ?: error("Camera is not ready")
+        val previousState = JSONObject(appliedState.toString())
+        val previousDimmed = screenDimmed
+        try {
+            validateAndApplyCameraSettings(builder, chars, controls)
+            if (controls.hasValue("screenDimmed")) {
+                val requested = controls.getBoolean("screenDimmed")
+                require(onScreenDimChange(requested)) { "Phone could not change screen brightness" }
+                screenDimmed = requested
+            }
+            pendingCommand = commandId
+            pendingControls = JSONObject(controls.toString())
+            val request = builder.apply { setTag(commandId) }.build()
+            session?.setRepeatingRequest(request, captureResults, handler)
+                ?: error("Camera session ended")
+            scheduleAcknowledgementTimeout(commandId)
+        } catch (error: Exception) {
+            pendingCommand = null
+            if (screenDimmed != previousDimmed) {
+                onScreenDimChange(previousDimmed)
+                screenDimmed = previousDimmed
+            }
+            rebuildConfirmedRequest(previousState)
+            throw error
+        }
+    }
+
+    private fun validateAndApplyCameraSettings(
+        builder: CaptureRequest.Builder,
+        chars: CameraCharacteristics,
+        controls: JSONObject,
+    ) {
+        if (controls.hasValue("zoom")) {
+            val value = controls.getDouble("zoom")
+            val zoomRatioRange = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+            val digitalZoomMax = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)
+            val minimum = zoomRatioRange?.lower ?: 1f
+            val maximum = zoomRatioRange?.upper ?: digitalZoomMax
+            require(value.isFinite() && maximum != null && value >= minimum && value <= maximum) {
+                "Unsupported zoom"
+            }
+            if (zoomRatioRange != null) {
+                builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, value.toFloat())
+            } else {
+                val activeArray = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                    ?: error("Camera crop information is unavailable")
+                val cropWidth = (activeArray.width() / value).toInt().coerceAtLeast(1)
+                val cropHeight = (activeArray.height() / value).toInt().coerceAtLeast(1)
+                val left = activeArray.left + (activeArray.width() - cropWidth) / 2
+                val top = activeArray.top + (activeArray.height() - cropHeight) / 2
+                builder.set(CaptureRequest.SCALER_CROP_REGION, Rect(left, top, left + cropWidth, top + cropHeight))
+            }
+        }
+        if (controls.hasValue("exposure")) {
+            val requestedEv = controls.getDouble("exposure")
+            val range = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+            val step = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)?.toFloat()
+            require(requestedEv.isFinite() && range != null && step != null && step > 0f) {
+                "Exposure compensation is unavailable"
+            }
+            val stepEv = step.toDouble()
+            val index = (requestedEv / stepEv).roundToInt()
+            require(range.contains(index) && kotlin.math.abs(index * stepEv - requestedEv) <= maxOf(0.0001, stepEv * 0.001)) {
+                "Unsupported exposure compensation step"
+            }
+            builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, index)
+        }
+        if (controls.hasValue("torch")) {
+            val torch = controls.getBoolean("torch")
+            require(chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true || !torch) {
+                "Torch unavailable"
+            }
+            builder.set(CaptureRequest.FLASH_MODE, if (torch) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
+        }
+    }
+
+    private fun rebuildConfirmedRequest(previous: JSONObject) {
+        val opened = camera ?: return
+        val surface = encoderSurface ?: return
+        val chars = characteristics ?: return
+        try {
+            val builder = opened.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                addTarget(surface)
+                set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(TARGET_FPS, TARGET_FPS))
+            }
+            if (previous.hasValue("zoom")) {
+                validateAndApplyCameraSettings(builder, chars, JSONObject().put("zoom", previous.getDouble("zoom")))
+            }
+            if (previous.hasValue("exposure")) {
+                validateAndApplyCameraSettings(builder, chars, JSONObject().put("exposure", previous.getDouble("exposure")))
+            }
+            if (previous.optBoolean("torch", false)) {
+                validateAndApplyCameraSettings(builder, chars, JSONObject().put("torch", true))
+            }
+            requestBuilder = builder
+            val request = builder.build()
+            session?.setRepeatingRequest(request, captureResults, cameraHandler)
+        } catch (_: Exception) {
+            // A rejected request is reported to the desktop; the current stream stays fail-closed.
+        }
+    }
+
+    private fun switchCamera(target: SupportedCamera, commandId: String, controls: JSONObject) {
+        val handler = cameraHandler ?: error("Camera handler is unavailable")
+        val manager = context.getSystemService(CameraManager::class.java)
+        val surface = encoderSurface ?: error("Encoder surface is unavailable")
+        val generation = callbackGeneration
+        val previousDimmed = screenDimmed
+        pendingCommand = commandId
+        pendingControls = JSONObject(controls.toString())
+        if (controls.hasValue("screenDimmed")) {
+            val requested = controls.getBoolean("screenDimmed")
+            require(onScreenDimChange(requested)) { "Phone could not change screen brightness" }
+            screenDimmed = requested
+        }
+        scheduleAcknowledgementTimeout(commandId)
+        session?.let {
+            runCatching { it.stopRepeating() }
+            runCatching { it.abortCaptures() }
+            it.close()
+        }
+        session = null
+        camera?.close()
+        camera = null
+        requestBuilder = null
+        try {
+            manager.openCamera(target.id, object : CameraDevice.StateCallback() {
+                override fun onOpened(device: CameraDevice) {
+                    if (!active.get() || generation != callbackGeneration) {
+                        device.close()
+                        return
+                    }
+                    camera = device
+                    try {
+                        val targetCharacteristics = manager.getCameraCharacteristics(target.id)
+                        device.createCaptureSession(listOf(surface), object : CameraCaptureSession.StateCallback() {
+                        override fun onConfigured(configured: CameraCaptureSession) {
+                            if (!active.get() || generation != callbackGeneration) {
+                                configured.close()
+                                device.close()
+                                return
+                            }
+                            try {
+                                val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                                    addTarget(surface)
+                                    set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(target.fpsRangeLower, target.fpsRangeUpper))
+                                }
+                                validateAndApplyCameraSettings(builder, targetCharacteristics, controls)
+                                selectedId = target.id
+                                characteristics = targetCharacteristics
+                                session = configured
+                                requestBuilder = builder
+                                val request = builder.apply { setTag(commandId) }.build()
+                                configured.setRepeatingRequest(request, captureResults, handler)
+                            } catch (error: Exception) {
+                                configured.close()
+                                device.close()
+                                camera = null
+                                session = null
+                                restoreScreenDimmed(previousDimmed)
+                                failCameraCommand(commandId, error.message ?: "Camera switch failed")
+                            }
+                        }
+
+                        override fun onConfigureFailed(configured: CameraCaptureSession) {
+                            configured.close()
+                            device.close()
+                            restoreScreenDimmed(previousDimmed)
+                            failCameraCommand(commandId, "Camera session could not be configured")
+                        }
+                        }, handler)
+                    } catch (error: Exception) {
+                        device.close()
+                        camera = null
+                        restoreScreenDimmed(previousDimmed)
+                        failCameraCommand(commandId, error.message ?: "Camera could not be configured")
+                    }
+                }
+
+                override fun onDisconnected(device: CameraDevice) {
+                    device.close()
+                    restoreScreenDimmed(previousDimmed)
+                    failCameraCommand(commandId, "Camera disconnected during switch")
+                }
+
+                override fun onError(device: CameraDevice, error: Int) {
+                    device.close()
+                    restoreScreenDimmed(previousDimmed)
+                    failCameraCommand(commandId, "Camera switch failed with code $error")
+                }
+            }, handler)
+        } catch (error: Exception) {
+            restoreScreenDimmed(previousDimmed)
+            failCameraCommand(commandId, error.message ?: "Camera switch failed")
+        }
+    }
+
+    private fun restoreScreenDimmed(previous: Boolean) {
+        if (screenDimmed != previous) {
+            onScreenDimChange(previous)
+            screenDimmed = previous
+        }
+    }
+
+    private fun scheduleAcknowledgementTimeout(commandId: String) {
+        cameraHandler?.postDelayed({
+            if (pendingCommand == commandId && active.get()) {
+                pendingCommand = null
+                pendingControls = null
+                publishState(commandId, "Camera did not acknowledge adjustment before timeout")
+                active.set(false)
+            }
+        }, 3_000)
+    }
+
+    private fun failCameraCommand(commandId: String, reason: String) {
+        if (pendingCommand == commandId) {
+            pendingCommand = null
+            pendingControls = null
+            publishState(commandId, reason)
+        } else if (pendingCommand == null) {
+            publishState("", reason)
+        }
+        active.set(false)
+    }
+
+    private fun JSONObject.hasValue(key: String) = has(key) && !isNull(key)
+
+    private val captureResults = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+            if (!active.get()) return
+            val activeArray = characteristics?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            val actualZoom = result.get(CaptureResult.CONTROL_ZOOM_RATIO)?.toDouble()
+                ?: result.get(CaptureResult.SCALER_CROP_REGION)?.let { crop ->
+                    crop.width().takeIf { it > 0 }?.let { width -> activeArray?.width()?.toDouble()?.div(width) }
+                }
+            appliedState = JSONObject().put("cameraId", selectedId)
+                .put("width", TARGET_SIZE.width).put("height", TARGET_SIZE.height)
+                .put("fps", result.get(CaptureResult.CONTROL_AE_TARGET_FPS_RANGE)?.upper ?: TARGET_FPS)
+                .put("zoom", actualZoom ?: JSONObject.NULL)
+                .put("exposure", result.get(CaptureResult.CONTROL_AE_EXPOSURE_COMPENSATION)?.let { index ->
+                    characteristics?.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)?.toFloat()?.let { index * it }
+                } ?: JSONObject.NULL)
+                .put("torch", result.get(CaptureResult.FLASH_MODE) == CaptureRequest.FLASH_MODE_TORCH)
+                .put("previewMirrored", false).put("screenDimmed", screenDimmed)
+            val command = if (request.tag == pendingCommand) pendingCommand else null
+            if (!statePublished || command != null) {
+                statePublished = true
+                if (command == null) {
+                    publishState("", null)
+                } else {
+                    val expected = pendingControls
+                    val error = if (expected == null) {
+                        "Camera control request was not retained"
+                    } else {
+                        appliedControlError(expected)
+                    }
+                    pendingCommand = null
+                    pendingControls = null
+                    publishState(command, error)
+                    if (error != null) active.set(false)
+                }
+            }
+        }
+    }
+
+    private fun appliedControlError(controls: JSONObject): String? {
+        if (controls.hasValue("cameraId") && appliedState.optString("cameraId") != controls.getString("cameraId")) {
+            return "Camera did not acknowledge the selected camera"
+        }
+        if ((controls.hasValue("width") && appliedState.optInt("width") != controls.getInt("width")) ||
+            (controls.hasValue("height") && appliedState.optInt("height") != controls.getInt("height"))
+        ) {
+            return "Camera did not acknowledge the selected size"
+        }
+        if (controls.hasValue("fps") &&
+            kotlin.math.abs(appliedState.optDouble("fps", Double.NaN) - controls.getDouble("fps")) > 0.001
+        ) {
+            return "Camera did not acknowledge the selected frame rate"
+        }
+        if (controls.hasValue("zoom")) {
+            val requested = controls.getDouble("zoom")
+            val applied = appliedState.optDouble("zoom", Double.NaN)
+            if (!applied.isFinite() || kotlin.math.abs(applied - requested) > maxOf(0.02, requested * 0.002)) {
+                return "Camera did not apply the requested zoom"
+            }
+        }
+        if (controls.hasValue("exposure")) {
+            val requested = controls.getDouble("exposure")
+            val applied = appliedState.optDouble("exposure", Double.NaN)
+            val step = characteristics?.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)?.toFloat()
+                ?.toDouble() ?: 0.0
+            if (!applied.isFinite() || kotlin.math.abs(applied - requested) > maxOf(0.0001, step * 0.001)) {
+                return "Camera did not apply the requested exposure compensation"
+            }
+        }
+        if (controls.hasValue("torch") && appliedState.optBoolean("torch") != controls.getBoolean("torch")) {
+            return "Camera did not apply the requested torch state"
+        }
+        if (controls.hasValue("screenDimmed") &&
+            appliedState.optBoolean("screenDimmed") != controls.getBoolean("screenDimmed")
+        ) {
+            return "Phone did not apply the requested screen brightness"
+        }
+        return null
+    }
+
+    private fun publishState(commandId: String, error: String?) {
+        if (!active.get() || appliedState.length() == 0) return
+        runCatching {
+            onCameraState(JSONObject().put("type", "camera_state").put("command_id", commandId)
+                .put("generation", binding.generation).put("capabilities", capabilities())
+                .put("applied", appliedState).put("error", error?.take(256) ?: JSONObject.NULL))
+        }
+    }
+
+    private fun capabilities(): JSONObject {
+        return CameraCapabilities.toJson(supportedCameras, selectedId, screenDimSupported = true)
+    }
 
     fun start() {
         check(active.compareAndSet(false, true)) { "Capture pipeline is already active" }
@@ -120,6 +504,7 @@ internal class CameraStreamer(
             error("Capture startup was cancelled")
         }
         plain.connect(InetSocketAddress(endpoint.host, endpoint.port), 5_000)
+        plain.tcpNoDelay = true
         plain.soTimeout = 10_000
         val tls = tlsContext.socketFactory.createSocket(
             plain,
@@ -158,31 +543,70 @@ internal class CameraStreamer(
         return rawOutput
     }
 
-    private data class SelectedCamera(val id: String, val fpsRange: Range<Int>)
-
-    private fun selectCamera(): SelectedCamera {
+    private fun selectCamera(): SupportedCamera {
         val manager = context.getSystemService(CameraManager::class.java)
         val candidates = manager.cameraIdList.mapNotNull { id ->
-            val characteristics = manager.getCameraCharacteristics(id)
-            val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-                ?: return@mapNotNull null
-            val sizes = map.getOutputSizes(MediaCodec::class.java) ?: emptyArray()
-            if (TARGET_SIZE !in sizes) return@mapNotNull null
-            val ranges = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
-                ?: return@mapNotNull null
-            val exact = ranges.firstOrNull { it.lower == TARGET_FPS && it.upper == TARGET_FPS }
-                ?: return@mapNotNull null
-            Triple(id, characteristics.get(CameraCharacteristics.LENS_FACING), exact)
+            runCatching {
+                val characteristics = manager.getCameraCharacteristics(id)
+                val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                    ?: return@mapNotNull null
+                val sizes = map.getOutputSizes(MediaCodec::class.java) ?: return@mapNotNull null
+                val ranges = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                    ?: return@mapNotNull null
+                if (!CameraCapabilities.supportsNativeTuple(
+                        TARGET_SIZE.width,
+                        TARGET_SIZE.height,
+                        sizes.map { it.width to it.height },
+                        ranges.map { it.lower to it.upper },
+                    )
+                ) return@mapNotNull null
+                val fps = ranges.first { it.lower <= TARGET_FPS && TARGET_FPS <= it.upper }
+                val facingValue = characteristics.get(CameraCharacteristics.LENS_FACING)
+                val facing = when (facingValue) {
+                    CameraCharacteristics.LENS_FACING_FRONT -> "user"
+                    CameraCharacteristics.LENS_FACING_BACK -> "environment"
+                    CameraCharacteristics.LENS_FACING_EXTERNAL -> "external"
+                    else -> "unknown"
+                }
+                val label = when (facing) {
+                    "user" -> "Front camera"
+                    "external" -> "External camera"
+                    "environment" -> "Rear camera"
+                    else -> "Camera"
+                }
+                val ratioRange = characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+                val digitalZoom = characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)
+                val zoomMin = ratioRange?.lower ?: 1f.takeIf { digitalZoom != null && digitalZoom > 1f }
+                val zoomMax = ratioRange?.upper ?: digitalZoom?.takeIf { it > 1f }
+                val exposureRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+                    ?.takeIf { it.lower != it.upper }
+                val exposureStep = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
+                    ?.toFloat()?.takeIf { it.isFinite() && it > 0f }
+                SupportedCamera(
+                    id = id,
+                    label = label,
+                    facing = facing,
+                    fpsRangeLower = fps.lower,
+                    fpsRangeUpper = fps.upper,
+                    zoomMin = zoomMin,
+                    zoomMax = zoomMax,
+                    exposureMin = exposureRange?.lower?.takeIf { exposureStep != null },
+                    exposureMax = exposureRange?.upper?.takeIf { exposureStep != null },
+                    exposureStepEv = exposureStep,
+                    torch = characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true,
+                )
+            }.getOrNull()
         }
-        val selected = candidates.firstOrNull { it.second == CameraCharacteristics.LENS_FACING_BACK }
-            ?: candidates.firstOrNull()
+        supportedCameras = candidates
+        return CameraCapabilities.defaultCamera(candidates)
             ?: error("No camera exposes the required 1280×720 at fixed 30 fps tuple")
-        return SelectedCamera(selected.first, selected.third)
     }
 
     @SuppressLint("MissingPermission")
     @Suppress("DEPRECATION")
-    private fun configureEncoderAndCamera(selected: SelectedCamera) {
+    private fun configureEncoderAndCamera(selected: SupportedCamera) {
+        selectedId = selected.id
+        characteristics = context.getSystemService(CameraManager::class.java).getCameraCharacteristics(selected.id)
         val generation = callbackGeneration
         val codec = callbackGate.acquire(
             generation,
@@ -201,6 +625,7 @@ internal class CameraStreamer(
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
             setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel31)
+            setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
         }
         codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         callbackGate.requireCurrent(generation)
@@ -223,6 +648,7 @@ internal class CameraStreamer(
             },
         )
         val handler = Handler(handlerThread.looper)
+        cameraHandler = handler
         val manager = context.getSystemService(CameraManager::class.java)
         val cameraLatch = CountDownLatch(1)
         val failure = AtomicReference<String?>()
@@ -283,11 +709,12 @@ internal class CameraStreamer(
         require(sessionLatch.await(5, TimeUnit.SECONDS)) { "Timed out configuring camera" }
         failure.get()?.let(::error)
         callbackGate.requireCurrent(generation)
-        val request = opened.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+        val builder = opened.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
             addTarget(surface)
-            set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, selected.fpsRange)
-        }.build()
-        session?.setRepeatingRequest(request, null, handler)
+            set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(selected.fpsRangeLower, selected.fpsRangeUpper))
+        }
+        requestBuilder = builder
+        session?.setRepeatingRequest(builder.build(), captureResults, handler)
             ?: error("Camera capture session was not created")
     }
 
@@ -303,16 +730,17 @@ internal class CameraStreamer(
                 }
                 index >= 0 -> {
                     val buffer = codec.getOutputBuffer(index) ?: error("Encoder output buffer is missing")
-                    val encoded = ByteArray(info.size)
-                    buffer.position(info.offset)
-                    buffer.limit(info.offset + info.size)
-                    buffer.get(encoded)
+                    val encoded = MediaCodecOutput.copy(buffer, info.offset, info.size)
                     val configuration = info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
                     val keyFrame = info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
                     if (configuration) {
                         codecConfig = encoded
                     } else if (encoded.isNotEmpty()) {
-                        val payload = if (keyFrame && codecConfig.isNotEmpty()) codecConfig + encoded else encoded
+                        val payload = if (keyFrame && codecConfig.isNotEmpty()) {
+                            MediaCodecOutput.prependCodecConfig(codecConfig, encoded)
+                        } else {
+                            encoded
+                        }
                         val sequence = nextSequence.getAndIncrement()
                         writeMediaRecord(sequence, info.presentationTimeUs, keyFrame, payload)
                     }
@@ -405,8 +833,8 @@ internal class CameraStreamer(
     }
 
     companion object {
-        private val TARGET_SIZE = Size(1280, 720)
-        private const val TARGET_FPS = 30
+        private val TARGET_SIZE = Size(CameraCapabilities.NATIVE_WIDTH, CameraCapabilities.NATIVE_HEIGHT)
+        private const val TARGET_FPS = CameraCapabilities.NATIVE_FPS
         private const val LEASE_MILLIS = 10_000L
     }
 }

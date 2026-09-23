@@ -76,6 +76,26 @@ class ControlProtocolTest {
     }
 
     @Test
+    fun `camera controls carry a bounded id generation and only known fields`() {
+        val response = ControlProtocol.parseResponse(
+            """{"type":"camera_control","command_id":"adjust-1","generation":9,"controls":{"cameraId":"1","zoom":1.5,"screenDimmed":true}}""",
+        ) as ControlResponse.CameraControl
+
+        assertEquals("adjust-1", response.commandId)
+        assertEquals(9, response.generation)
+        assertEquals("1", response.controls.getString("cameraId"))
+        assertEquals(1.5, response.controls.getDouble("zoom"), 0.0001)
+        assertTrue(response.controls.getBoolean("screenDimmed"))
+        for (invalid in listOf(
+            """{"type":"camera_control","command_id":"x","generation":0,"controls":{"torch":true}}""",
+            """{"type":"camera_control","command_id":"x","generation":1,"controls":{"focus":true}}""",
+            """{"type":"camera_control","command_id":"","generation":1,"controls":{"torch":true}}""",
+        )) {
+            assertThrows(IllegalArgumentException::class.java) { ControlProtocol.parseResponse(invalid) }
+        }
+    }
+
+    @Test
     fun `pong and stop messages remain strict and bounded`() {
         val pong = ControlProtocol.parseResponse("""{"type":"pong","capture_authorized":false}""")
         assertFalse((pong as ControlResponse.Pong).captureAuthorized)
