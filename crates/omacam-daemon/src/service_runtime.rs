@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use omacam_core::camera::{AppliedCameraState, CameraCapabilities, RequestedControls};
 use omacam_core::{
     CaptureState, ConnectionState, OutputState, SessionPolicy, SessionSnapshot, TrustState,
 };
@@ -11,9 +12,20 @@ const MAX_OPERATIONS: usize = 32;
 
 #[derive(Debug)]
 pub(crate) enum ServiceIntent {
-    RequestStart { operation_id: String },
-    Stop { operation_id: String },
-    ForgetPeer { operation_id: String },
+    CameraControl {
+        operation_id: String,
+        generation: u64,
+        controls: RequestedControls,
+    },
+    RequestStart {
+        operation_id: String,
+    },
+    Stop {
+        operation_id: String,
+    },
+    ForgetPeer {
+        operation_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -35,14 +47,31 @@ pub(crate) struct OperationSnapshot {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeSnapshot {
+    pub(crate) camera_capabilities: Option<CameraCapabilities>,
+    pub(crate) applied_camera: Option<AppliedCameraState>,
+    pub(crate) capture_stats: Option<CaptureStatsSnapshot>,
     pub(crate) revision: u64,
     pub(crate) state: SessionSnapshot,
     pub(crate) operations: Vec<OperationSnapshot>,
     pub(crate) last_error: Option<OperationSnapshot>,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CaptureStatsSnapshot {
+    pub(crate) window_ms: u64,
+    pub(crate) frames_written: u64,
+    pub(crate) dropped_queue_frames_total: u64,
+    pub(crate) avg_queue_delay_ms: f64,
+    pub(crate) avg_output_write_ms: f64,
+    pub(crate) max_output_write_ms: f64,
+}
+
 #[derive(Debug)]
 struct RuntimeInner {
+    camera_capabilities: Option<CameraCapabilities>,
+    applied_camera: Option<AppliedCameraState>,
+    capture_stats: Option<CaptureStatsSnapshot>,
     revision: u64,
     state: SessionSnapshot,
     operations: VecDeque<OperationSnapshot>,
@@ -66,6 +95,9 @@ impl ServiceRuntime {
         (
             Self {
                 inner: Arc::new(Mutex::new(RuntimeInner {
+                    camera_capabilities: None,
+                    applied_camera: None,
+                    capture_stats: None,
                     revision: 1,
                     state: policy.snapshot(),
                     operations: VecDeque::new(),
@@ -81,6 +113,9 @@ impl ServiceRuntime {
     pub(crate) fn snapshot(&self) -> RuntimeSnapshot {
         let inner = self.inner.lock().expect("service runtime mutex poisoned");
         RuntimeSnapshot {
+            camera_capabilities: inner.camera_capabilities.clone(),
+            applied_camera: inner.applied_camera.clone(),
+            capture_stats: inner.capture_stats.clone(),
             revision: inner.revision,
             state: inner.state,
             operations: inner.operations.iter().cloned().collect(),
@@ -139,13 +174,18 @@ impl ServiceRuntime {
     /// Invalidates authorization before transport and resource cleanup begins.
     pub(crate) fn invalidate_stop(&self) {
         let mut inner = self.inner.lock().expect("service runtime mutex poisoned");
+        inner.applied_camera = None;
+        inner.camera_capabilities = None;
+        inner.capture_stats = None;
         let active = inner.state.capture != CaptureState::Idle || inner.state.capture_armed;
         let mut cancelled_start = None;
         for operation in &mut inner.operations {
-            if operation.intent == "request_start" && operation.state == OperationState::Pending {
+            if matches!(operation.intent, "request_start" | "camera_control")
+                && operation.state == OperationState::Pending
+            {
                 operation.state = OperationState::Failed;
                 operation.error_code = Some("cancelled");
-                operation.message = Some("Start was cancelled by Stop".to_owned());
+                operation.message = Some("Operation was cancelled by Stop".to_owned());
                 cancelled_start = Some(operation.clone());
             }
         }
@@ -182,6 +222,102 @@ impl ServiceRuntime {
             ConnectionState::Recovering
         };
         Self::advance(&mut inner, &self.revision_tx);
+    }
+
+    pub(crate) fn publish_camera(
+        &self,
+        generation: u64,
+        capabilities: CameraCapabilities,
+        applied: AppliedCameraState,
+    ) {
+        let mut inner = self.inner.lock().expect("service runtime mutex poisoned");
+        if inner.state.generation != generation || !inner.state.capture_armed {
+            return;
+        }
+        let changed = inner.camera_capabilities.as_ref().is_none_or(|current| {
+            serde_json::to_value(current).ok() != serde_json::to_value(&capabilities).ok()
+        }) || inner.applied_camera.as_ref().is_none_or(|current| {
+            serde_json::to_value(current).ok() != serde_json::to_value(&applied).ok()
+        });
+        inner.camera_capabilities = Some(capabilities);
+        inner.applied_camera = Some(applied);
+        if changed {
+            Self::advance(&mut inner, &self.revision_tx);
+        }
+    }
+
+    pub(crate) fn publish_capture_stats(&self, generation: u64, stats: CaptureStatsSnapshot) {
+        let mut inner = self.inner.lock().expect("service runtime mutex poisoned");
+        if inner.state.generation != generation || !inner.state.capture_armed {
+            return;
+        }
+        inner.capture_stats = Some(stats);
+        Self::advance(&mut inner, &self.revision_tx);
+    }
+
+    pub(crate) async fn camera_control(
+        &self,
+        operation_id: String,
+        generation: u64,
+        controls: RequestedControls,
+    ) -> Result<(), &'static str> {
+        if controls.stop == Some(true) {
+            return self.stop(operation_id).await;
+        }
+        let snapshot = self.snapshot();
+        if snapshot.state.generation != generation || !snapshot.state.capture_armed {
+            return Err("stale_capture");
+        }
+        let capabilities = snapshot
+            .camera_capabilities
+            .as_ref()
+            .ok_or("camera_unavailable")?;
+        let applied = snapshot
+            .applied_camera
+            .as_ref()
+            .ok_or("camera_unavailable")?;
+        controls.validate(capabilities)?;
+        let camera_id = controls.camera_id.as_deref().unwrap_or(&applied.camera_id);
+        let camera = capabilities
+            .cameras
+            .iter()
+            .find(|camera| camera.id == camera_id)
+            .ok_or("unknown_camera")?;
+        let changing_camera = camera_id != applied.camera_id;
+        if changing_camera
+            && (controls.zoom.is_some() || controls.exposure.is_some() || controls.torch.is_some())
+        {
+            return Err("select_camera_before_adjusting_controls");
+        }
+        let width = controls.width.unwrap_or(applied.width);
+        let height = controls.height.unwrap_or(applied.height);
+        let fps = controls.fps.unwrap_or(applied.fps);
+        if !camera.modes.iter().any(|mode| {
+            mode.width == width && mode.height == height && mode.fps.to_bits() == fps.to_bits()
+        }) {
+            return Err("unsupported_mode");
+        }
+        if !self.enqueue(operation_id.clone(), "camera_control")? {
+            return Ok(());
+        }
+        if self
+            .intent_tx
+            .send(ServiceIntent::CameraControl {
+                operation_id: operation_id.clone(),
+                generation,
+                controls,
+            })
+            .await
+            .is_err()
+        {
+            self.fail(
+                &operation_id,
+                "service_unavailable",
+                "service intent receiver stopped",
+            );
+            return Err("service_unavailable");
+        }
+        Ok(())
     }
 
     pub(crate) async fn request_start(&self, operation_id: String) -> Result<(), &'static str> {
@@ -363,6 +499,71 @@ impl ServiceRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn supported_camera_caps() -> (CameraCapabilities, AppliedCameraState) {
+        (
+            CameraCapabilities {
+                cameras: vec![
+                    omacam_core::camera::Camera {
+                        id: "rear".into(),
+                        label: "Rear camera".into(),
+                        facing: "environment".into(),
+                        modes: vec![omacam_core::camera::CameraMode {
+                            width: 1280,
+                            height: 720,
+                            fps: 30.0,
+                        }],
+                        frame_rates: vec![30.0],
+                    },
+                    omacam_core::camera::Camera {
+                        id: "front".into(),
+                        label: "Front camera".into(),
+                        facing: "user".into(),
+                        modes: vec![omacam_core::camera::CameraMode {
+                            width: 1280,
+                            height: 720,
+                            fps: 30.0,
+                        }],
+                        frame_rates: vec![30.0],
+                    },
+                ],
+                zoom: Some(omacam_core::camera::ControlRange {
+                    min: 1.0,
+                    max: 4.0,
+                    step: 0.01,
+                }),
+                exposure_compensation: None,
+                torch: true,
+                focus_modes: Vec::new(),
+                screen_dim_supported: true,
+            },
+            AppliedCameraState {
+                camera_id: "rear".into(),
+                width: 1280,
+                height: 720,
+                fps: 30.0,
+                zoom: Some(1.0),
+                exposure: None,
+                torch: false,
+                preview_mirrored: false,
+                screen_dimmed: false,
+            },
+        )
+    }
+
+    fn armed_runtime() -> (ServiceRuntime, mpsc::Receiver<ServiceIntent>, u64) {
+        let mut policy = SessionPolicy::default();
+        policy.set_output_ready();
+        policy.trust_peer();
+        policy.authenticate_connection().expect("online");
+        policy.request_start().expect("requested");
+        policy.grant_consent(0).expect("consent granted");
+        let generation = policy.snapshot().generation;
+        let (runtime, receiver) = ServiceRuntime::new(&policy, "trust.json".into());
+        let (capabilities, applied) = supported_camera_caps();
+        runtime.publish_camera(generation, capabilities, applied);
+        (runtime, receiver, generation)
+    }
 
     #[tokio::test]
     async fn intents_are_bounded_idempotent_and_do_not_claim_success() {
@@ -556,5 +757,110 @@ mod tests {
             Err("output_unavailable")
         );
         assert!(runtime.snapshot().operations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stop_and_diagnostics_remain_usable_without_a_trusted_peer() {
+        let (runtime, mut receiver) =
+            ServiceRuntime::new(&SessionPolicy::default(), "trust".into());
+
+        runtime
+            .stop("stop-without-peer".into())
+            .await
+            .expect("Stop accepted");
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ServiceIntent::Stop { operation_id }) if operation_id == "stop-without-peer"
+        ));
+        runtime.succeed("stop-without-peer");
+
+        assert_eq!(
+            runtime.request_start("start-without-peer".into()).await,
+            Err("peer_not_trusted")
+        );
+        runtime
+            .run_diagnostics("diagnostics-after-stop")
+            .expect("diagnostics accepted after Stop");
+        assert_eq!(
+            runtime
+                .snapshot()
+                .operations
+                .iter()
+                .find(|operation| operation.id == "stop-without-peer")
+                .unwrap()
+                .state,
+            OperationState::Succeeded
+        );
+        assert_eq!(
+            runtime
+                .snapshot()
+                .operations
+                .iter()
+                .find(|operation| operation.id == "diagnostics-after-stop")
+                .unwrap()
+                .state,
+            OperationState::Succeeded
+        );
+    }
+
+    #[tokio::test]
+    async fn camera_controls_reject_unadvertised_modes_and_accept_supported_camera_selection() {
+        let (runtime, mut receiver, generation) = armed_runtime();
+
+        assert_eq!(
+            runtime
+                .camera_control(
+                    "unsupported-mode".into(),
+                    generation,
+                    RequestedControls {
+                        width: Some(1920),
+                        height: Some(1080),
+                        ..Default::default()
+                    },
+                )
+                .await,
+            Err("unsupported_mode"),
+        );
+        assert!(receiver.try_recv().is_err());
+
+        runtime
+            .camera_control(
+                "select-front".into(),
+                generation,
+                RequestedControls {
+                    camera_id: Some("front".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("supported camera selection accepted");
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ServiceIntent::CameraControl { operation_id, generation: intent_generation, .. })
+                if operation_id == "select-front" && intent_generation == generation
+        ));
+    }
+
+    #[tokio::test]
+    async fn camera_stop_control_uses_the_neutral_service_stop_intent() {
+        let (runtime, mut receiver, generation) = armed_runtime();
+
+        runtime
+            .camera_control(
+                "camera-stop".into(),
+                generation,
+                RequestedControls {
+                    stop: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("Stop accepted");
+
+        assert!(!runtime.snapshot().state.capture_armed);
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ServiceIntent::Stop { operation_id }) if operation_id == "camera-stop"
+        ));
     }
 }

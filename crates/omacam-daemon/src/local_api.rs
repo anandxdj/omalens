@@ -2,7 +2,7 @@
 use crate::control_server::{ControlServeOptions, run_owned_control_server};
 use crate::diagnostics::{doctor_report, omacam_output_ready, provider_report};
 use crate::load_trust_record;
-use crate::service_runtime::{OperationSnapshot, ServiceRuntime};
+use crate::service_runtime::{CaptureStatsSnapshot, OperationSnapshot, ServiceRuntime};
 use futures_util::StreamExt as _;
 use omacam_core::SessionPolicy;
 use omacam_core::control::CONTROL_PROTOCOL_VERSION;
@@ -27,7 +27,9 @@ struct LocalSnapshot {
     output: OutputSnapshot,
     preview: PreviewSnapshot,
     capabilities_revision: u64,
-    applied_settings: AppliedSettings,
+    applied_settings: Option<omacam_core::camera::AppliedCameraState>,
+    camera_capabilities: Option<omacam_core::camera::CameraCapabilities>,
+    stats: Option<CaptureStatsSnapshot>,
     operations: Vec<OperationSnapshot>,
     last_error: Option<OperationSnapshot>,
 }
@@ -50,8 +52,6 @@ struct PreviewSnapshot {
     source: &'static str,
     active: bool,
 }
-#[derive(Debug, Serialize)]
-struct AppliedSettings {}
 #[derive(Debug, Serialize)]
 struct DiagnosticsSnapshot {
     schema_version: u16,
@@ -96,6 +96,23 @@ impl SessionApi {
 impl SessionApi {
     fn get_snapshot(&self) -> zbus::fdo::Result<String> {
         self.snapshot_json()
+    }
+    async fn camera_control(
+        &self,
+        operation_id: String,
+        generation: u64,
+        controls_json: String,
+    ) -> zbus::fdo::Result<String> {
+        if controls_json.len() > 4096 {
+            return Err(Self::typed("controls_too_large"));
+        }
+        let controls =
+            serde_json::from_str(&controls_json).map_err(|_| Self::typed("invalid_controls"))?;
+        self.runtime
+            .camera_control(operation_id.clone(), generation, controls)
+            .await
+            .map_err(Self::typed)?;
+        Self::accepted(operation_id)
     }
     fn run_diagnostics(&self) -> zbus::fdo::Result<String> {
         self.diagnostics_json()
@@ -247,8 +264,10 @@ fn build_snapshot(runtime: &ServiceRuntime) -> LocalSnapshot {
             source: "post_decoder",
             active: current.state.capture == omacam_core::CaptureState::Streaming,
         },
-        capabilities_revision: 0,
-        applied_settings: AppliedSettings {},
+        capabilities_revision: current.revision,
+        applied_settings: current.applied_camera,
+        camera_capabilities: current.camera_capabilities,
+        stats: current.capture_stats,
         operations: current.operations,
         last_error: current.last_error,
     }

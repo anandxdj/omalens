@@ -24,6 +24,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::rustls::pki_types::PrivateKeyDer;
 
+mod browser_server;
 mod capture;
 mod control_server;
 mod diagnostics;
@@ -45,6 +46,7 @@ const USAGE: &str = "Usage:
   omacam-daemon ipc diagnostics
   omacam-daemon ipc events
   omacam-daemon ipc start|stop|forget|diagnostics-intent <OPERATION_ID>
+  omacam-daemon browser serve --endpoint <LAN_IP:HTTPS_PORT> --output-device /dev/videoN [--qr <SVG_PATH>] [--identity <JSON_PATH>]
   omacam-daemon pair serve --endpoint <LAN_IP:PORT> [--listen <IP:PORT>] [--name <NAME>] [--qr <SVG_PATH>] [--trust <JSON_PATH>] [--identity <JSON_PATH>]
   omacam-daemon pair status [--trust <JSON_PATH>]
   omacam-daemon pair forget [--trust <JSON_PATH>]
@@ -55,6 +57,7 @@ const MAX_PAIRING_FAILURES_PER_SOURCE: u8 = 5;
 const MAX_PAIRING_FAILURES_GLOBAL: u8 = 20;
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
     let exit_code = match args.first().map(String::as_str) {
@@ -87,6 +90,21 @@ async fn main() {
                 1
             }
         },
+        Some("browser") if args.get(1).map(String::as_str) == Some("serve") => {
+            match browser_server::BrowserServeOptions::parse(&args[2..]) {
+                Ok(options) => match browser_server::run(options).await {
+                    Ok(()) => 0,
+                    Err(error) => {
+                        eprintln!("Browser camera failed: {error}");
+                        1
+                    }
+                },
+                Err(error) => {
+                    eprintln!("{error}\n\n{USAGE}");
+                    2
+                }
+            }
+        }
         Some("--help" | "-h") => {
             println!("{USAGE}");
             0
@@ -159,6 +177,7 @@ struct PairServeOptions {
     qr_path: std::path::PathBuf,
     trust_path: std::path::PathBuf,
     identity_path: std::path::PathBuf,
+    auto_approve: bool,
 }
 
 impl PairServeOptions {
@@ -169,9 +188,15 @@ impl PairServeOptions {
         let mut qr_path = default_runtime_path("pairing.svg");
         let mut trust_path = default_data_path("trusted-phone.json");
         let mut identity_path = default_data_path("desktop-identity.json");
+        let mut auto_approve = false;
         let mut index = 0;
         while index < args.len() {
             let flag = args[index].as_str();
+            if flag == "--auto-approve" {
+                auto_approve = true;
+                index += 1;
+                continue;
+            }
             let value = args
                 .get(index + 1)
                 .ok_or_else(|| format!("missing value for {flag}"))?;
@@ -206,6 +231,7 @@ impl PairServeOptions {
             qr_path,
             trust_path,
             identity_path,
+            auto_approve,
         })
     }
 }
@@ -390,7 +416,12 @@ async fn run_pairing_ceremony(
     println!("Confirmation code: {}", verified.sas);
     println!("Approve only if the phone shows the same code.");
     let expected = verified.sas.clone();
-    let entered = tokio::task::spawn_blocking(move || prompt_for_code(&expected)).await??;
+    let entered = if options.auto_approve {
+        println!("Auto-approving pairing code {expected}");
+        true
+    } else {
+        tokio::task::spawn_blocking(move || prompt_for_code(&expected)).await??
+    };
     if !entered {
         session.reject();
         write_json_line(

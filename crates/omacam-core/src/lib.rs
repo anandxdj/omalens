@@ -3,6 +3,8 @@
 //! This crate deliberately contains no transport, UI, or operating-system code.
 //! Callers provide monotonic millisecond timestamps from one local clock.
 
+pub mod browser;
+pub mod camera;
 pub mod control;
 pub mod media;
 pub mod pairing;

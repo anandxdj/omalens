@@ -4,9 +4,7 @@
 //! ownership to this module. All exit paths invalidate policy first, write a
 //! terminal Stop to the isolated output worker, and tear down owned resources.
 
-use std::env;
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -14,13 +12,12 @@ use omacam_core::SessionPolicy;
 use omacam_core::control::{ControlProof, ControlSession};
 use omacam_core::media::{
     ControlConnectionId, MEDIA_HEADER_BYTES, MediaBinding, MediaRecord, MediaRecordKind,
-    MediaSessionId, MediaStreamValidator, OutputControlCommand, PeerIdentity, write_output_control,
-    write_record,
+    MediaSessionId, MediaStreamValidator, PeerIdentity,
 };
 use tokio::io::{AsyncReadExt as _, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, mpsc};
-use tokio::time::{Instant, interval, sleep_until, timeout};
+use tokio::time::{Instant, interval, timeout};
 use tokio_rustls::TlsAcceptor;
 
 use crate::CLIENT_STEP_TIMEOUT;
@@ -28,9 +25,12 @@ use crate::control_server::{
     ControlCommand, ControlConnectionOutcome, ControlReply, read_json_line, trust_record_matches,
     write_json_line,
 };
-use crate::service_runtime::{ServiceIntent, ServiceRuntime};
+use crate::service_runtime::{CaptureStatsSnapshot, ServiceIntent, ServiceRuntime};
 
-const OUTPUT_NEUTRALIZATION_MS: u64 = 500;
+#[path = "capture/output_worker.rs"]
+mod output_worker;
+pub(crate) use output_worker::OutputWorker;
+
 const MEDIA_QUEUE_CAPACITY: usize = 2;
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -62,7 +62,7 @@ pub(crate) async fn run_active_capture<W: tokio::io::AsyncWrite + Unpin>(
         }
         return Err("output worker is unavailable".into());
     };
-    if let Err(error) = output.bind(binding).await {
+    if let Err(error) = output.bind(binding) {
         policy.stop();
         if let Some((state, _)) = &runtime {
             state.set_output_failed(error.to_string());
@@ -98,6 +98,11 @@ pub(crate) async fn run_active_capture<W: tokio::io::AsyncWrite + Unpin>(
     let mut last_control = Instant::now();
     let mut output_sequence = 0_u64;
     let mut capture_started = false;
+    let mut stats_window_started = Instant::now();
+    let mut stats_frames_written = 0_u64;
+    let mut stats_queue_delay = Duration::ZERO;
+    let mut stats_output_write = Duration::ZERO;
+    let mut stats_output_write_max = Duration::ZERO;
     let mut outcome = ControlConnectionOutcome::CaptureStopped;
     let mut stop_reason: String;
     let mut fatal_error: Option<Box<dyn std::error::Error>> = None;
@@ -127,6 +132,19 @@ pub(crate) async fn run_active_capture<W: tokio::io::AsyncWrite + Unpin>(
                     break;
                 }
                 match command {
+                    ControlCommand::CameraState { command_id, generation, capabilities, applied, error } => {
+                        if generation == binding.generation
+                            && let Some((state, _)) = &runtime
+                        {
+                            let snapshot = state.snapshot();
+                            if snapshot.state.capture_armed && snapshot.state.generation == generation {
+                                state.publish_camera(generation, capabilities, applied);
+                                if !command_id.is_empty() {
+                                    match error { Some(message) => state.fail(&command_id, "camera_rejected", message), None => state.succeed(&command_id) }
+                                }
+                            }
+                        }
+                    }
                     ControlCommand::Ping => {
                         last_control = Instant::now();
                         if let Err(error) = policy.refresh_lease(binding.generation, monotonic_millis()) {
@@ -185,8 +203,9 @@ pub(crate) async fn run_active_capture<W: tokio::io::AsyncWrite + Unpin>(
                 }
             }
             media = media_rx.recv() => {
-                match media {
-                    Some(Ok(mut record)) => {
+                if let Some(media) = media {
+                    match media.result {
+                    Ok(mut record) => {
                         if record.kind == MediaRecordKind::Stop {
                             policy.stop();
                             stop_reason = "phone media channel sent terminal Stop".to_owned();
@@ -222,27 +241,53 @@ pub(crate) async fn run_active_capture<W: tokio::io::AsyncWrite + Unpin>(
                             break;
                         };
                         output_sequence = next_sequence;
-                        if let Err(error) = output.write(binding, &record) {
-                            if let Some((state, _)) = &runtime {
-                                state.set_output_failed(error.to_string());
+                        match output.write(binding, &record) {
+                            Ok(write_duration) => {
+                                stats_frames_written = stats_frames_written.saturating_add(1);
+                                stats_queue_delay = stats_queue_delay.saturating_add(media.queued_at.elapsed());
+                                stats_output_write = stats_output_write.saturating_add(write_duration);
+                                stats_output_write_max = stats_output_write_max.max(write_duration);
+                                if stats_window_started.elapsed() >= Duration::from_secs(1) {
+                                    if let Some((state, _)) = &runtime {
+                                        let frames = stats_frames_written.max(1);
+                                        state.publish_capture_stats(binding.generation, CaptureStatsSnapshot {
+                                        window_ms: u64::try_from(stats_window_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                        frames_written: stats_frames_written,
+                                        dropped_queue_frames_total: media.dropped_frames_total,
+                                        avg_queue_delay_ms: stats_queue_delay.as_secs_f64() * 1000.0 / f64::from(u32::try_from(frames).unwrap_or(u32::MAX)),
+                                        avg_output_write_ms: stats_output_write.as_secs_f64() * 1000.0 / f64::from(u32::try_from(frames).unwrap_or(u32::MAX)),
+                                            max_output_write_ms: stats_output_write_max.as_secs_f64() * 1000.0,
+                                        });
+                                    }
+                                    stats_window_started = Instant::now();
+                                    stats_frames_written = 0;
+                                    stats_queue_delay = Duration::ZERO;
+                                    stats_output_write = Duration::ZERO;
+                                    stats_output_write_max = Duration::ZERO;
+                                }
                             }
-                            policy.stop();
-                            stop_reason = format!("output worker failed: {error}");
-                            break;
+                            Err(error) => {
+                                if let Some((state, _)) = &runtime {
+                                    state.set_output_failed(error.to_string());
+                                }
+                                policy.stop();
+                                stop_reason = format!("output worker failed: {error}");
+                                break;
+                            }
                         }
                     }
-                    Some(Err(error)) => {
+                    Err(error) => {
                         policy.stop();
                         if let Some((state, _)) = &runtime { state.publish_policy(policy); }
                         stop_reason = format!("authenticated media failed: {error}");
                         break;
                     }
-                    None => {
-                        policy.stop();
-                        if let Some((state, _)) = &runtime { state.publish_policy(policy); }
-                        stop_reason = "authenticated media receiver ended".to_owned();
-                        break;
                     }
+                } else {
+                    policy.stop();
+                    if let Some((state, _)) = &runtime { state.publish_policy(policy); }
+                    stop_reason = "authenticated media receiver ended".to_owned();
+                    break;
                 }
             }
             _ = lease_tick.tick() => {
@@ -273,6 +318,14 @@ pub(crate) async fn run_active_capture<W: tokio::io::AsyncWrite + Unpin>(
             } => {
                 let intent = intent.ok_or("service intent channel stopped")?;
                 match intent {
+                    ServiceIntent::CameraControl { operation_id, generation, controls } => {
+                        let current = runtime.as_ref().map(|(state, _)| state.snapshot());
+                        if generation != binding.generation || current.is_some_and(|s| !s.state.capture_armed || s.state.generation != generation) {
+                            if let Some((state, _)) = &runtime { state.fail(&operation_id, "stale_capture", "capture was stopped or replaced"); }
+                        } else {
+                            write_json_line(control_write, &ControlReply::CameraControl { command_id: operation_id, generation, controls }).await?;
+                        }
+                    }
                     ServiceIntent::Stop { operation_id } => {
                         policy.stop();
                         if let Some((state, _)) = &runtime {
@@ -362,14 +415,22 @@ struct FreshMediaReceiver {
 }
 
 struct FreshMediaState {
-    queue: std::collections::VecDeque<Result<MediaRecord, String>>,
+    queue: std::collections::VecDeque<QueuedMedia>,
     closed: bool,
+    dropped_frames_total: u64,
+}
+
+struct QueuedMedia {
+    result: Result<MediaRecord, String>,
+    queued_at: Instant,
+    dropped_frames_total: u64,
 }
 
 fn fresh_media_channel() -> (FreshMediaSender, FreshMediaReceiver) {
     let state = Arc::new(Mutex::new(FreshMediaState {
         queue: std::collections::VecDeque::with_capacity(MEDIA_QUEUE_CAPACITY),
         closed: false,
+        dropped_frames_total: 0,
     }));
     let notify = Arc::new(Notify::new());
     (
@@ -394,13 +455,30 @@ impl FreshMediaSender {
         if terminal {
             // Terminal/error notifications outrank every queued access unit.
             state.queue.clear();
-            state.queue.push_back(item);
+            let dropped_frames_total = state.dropped_frames_total;
+            state.queue.push_back(QueuedMedia {
+                result: item,
+                queued_at: Instant::now(),
+                dropped_frames_total,
+            });
             state.closed = true;
         } else {
             while state.queue.len() >= MEDIA_QUEUE_CAPACITY {
-                state.queue.pop_front();
+                if state.queue.pop_front().is_some_and(|queued| {
+                    queued
+                        .result
+                        .as_ref()
+                        .is_ok_and(|record| record.kind == MediaRecordKind::H264AccessUnit)
+                }) {
+                    state.dropped_frames_total = state.dropped_frames_total.saturating_add(1);
+                }
             }
-            state.queue.push_back(item);
+            let dropped_frames_total = state.dropped_frames_total;
+            state.queue.push_back(QueuedMedia {
+                result: item,
+                queued_at: Instant::now(),
+                dropped_frames_total,
+            });
         }
         drop(state);
         self.notify.notify_one();
@@ -408,12 +486,13 @@ impl FreshMediaSender {
 }
 
 impl FreshMediaReceiver {
-    async fn recv(&mut self) -> Option<Result<MediaRecord, String>> {
+    async fn recv(&mut self) -> Option<QueuedMedia> {
         loop {
             let notified = self.notify.notified();
             let should_wait = {
                 let mut state = self.state.lock().expect("media queue mutex poisoned");
-                if let Some(item) = state.queue.pop_front() {
+                if let Some(mut item) = state.queue.pop_front() {
+                    item.dropped_frames_total = state.dropped_frames_total;
                     return Some(item);
                 }
                 !state.closed
@@ -437,6 +516,9 @@ async fn receive_authenticated_media(
     let (socket, _) = timeout(Duration::from_secs(10), listener.accept())
         .await
         .map_err(|_| "media connection timed out".to_owned())?
+        .map_err(|error| error.to_string())?;
+    socket
+        .set_nodelay(true)
         .map_err(|error| error.to_string())?;
     let tls_stream = timeout(CLIENT_STEP_TIMEOUT, acceptor.accept(socket))
         .await
@@ -517,172 +599,6 @@ async fn receive_authenticated_media(
     }
 }
 
-pub(crate) struct OutputWorker {
-    child: Child,
-    input: Option<ChildStdin>,
-    current_binding: Option<MediaBinding>,
-    neutral_until: Option<Instant>,
-    failure: Option<String>,
-}
-
-impl OutputWorker {
-    pub(crate) fn spawn_service(
-        device: &Path,
-        preview_socket: Option<&Path>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let executable = env::current_exe()?
-            .parent()
-            .map(|parent| parent.join("omacam-output"))
-            .filter(|path| path.exists())
-            .unwrap_or_else(|| "omacam-output".into());
-        // Keep the worker itself a child of the daemon and arrange for it to
-        // receive TERM if the daemon disappears. Its GStreamer child has its
-        // own parent-death signal in omacam-output.
-        let mut command = Command::new("setpriv");
-        command.args(["--pdeathsig", "TERM"]).arg(executable);
-        command.arg("--device").arg(device).arg("--service-stdin");
-        if let Some(socket) = preview_socket {
-            command.arg("--preview-socket").arg(socket);
-        }
-        let mut child = command.stdin(Stdio::piped()).spawn()?;
-        let input = child
-            .stdin
-            .take()
-            .ok_or("output worker did not expose media input")?;
-        let mut worker = Self {
-            child,
-            input: Some(input),
-            current_binding: None,
-            neutral_until: None,
-            failure: None,
-        };
-        worker
-            .check_health()
-            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
-        Ok(worker)
-    }
-
-    pub(crate) fn check_health(&mut self) -> Result<(), String> {
-        if let Some(error) = &self.failure {
-            return Err(error.clone());
-        }
-        match self.child.try_wait() {
-            Ok(None) => Ok(()),
-            Ok(Some(status)) => {
-                let error = format!("output worker exited unexpectedly with {status}");
-                self.failure = Some(error.clone());
-                self.input.take();
-                Err(error)
-            }
-            Err(error) => {
-                let message = format!("could not inspect output worker: {error}");
-                self.failure = Some(message.clone());
-                self.input.take();
-                Err(message)
-            }
-        }
-    }
-
-    pub(crate) fn is_healthy(&mut self) -> bool {
-        self.check_health().is_ok()
-    }
-
-    pub(crate) async fn bind(
-        &mut self,
-        binding: MediaBinding,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        if self.current_binding.is_some() {
-            return Err("output binding requires a reset before rebind".into());
-        }
-        if let Some(deadline) = self.neutral_until {
-            sleep_until(deadline).await;
-        }
-        self.check_health()
-            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
-        let input = self
-            .input
-            .as_mut()
-            .ok_or("output worker media input is closed")?;
-        write_output_control(input, OutputControlCommand::Bind(binding))?;
-        std::io::Write::flush(input)?;
-        self.current_binding = Some(binding);
-        self.neutral_until = None;
-        Ok(())
-    }
-
-    pub(crate) fn reset(
-        &mut self,
-        binding: MediaBinding,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        if self
-            .current_binding
-            .is_some_and(|current| current != binding)
-        {
-            return Err("output reset belongs to a different generation".into());
-        }
-        self.check_health()
-            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
-        if self.current_binding.is_some() {
-            let input = self
-                .input
-                .as_mut()
-                .ok_or("output worker media input is closed")?;
-            write_output_control(input, OutputControlCommand::Reset(binding))?;
-            std::io::Write::flush(input)?;
-        }
-        self.current_binding = None;
-        self.neutral_until = Some(Instant::now() + Duration::from_millis(OUTPUT_NEUTRALIZATION_MS));
-        Ok(())
-    }
-
-    fn write(
-        &mut self,
-        binding: MediaBinding,
-        record: &MediaRecord,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        self.check_health()
-            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
-        if self.current_binding != Some(binding) {
-            return Err("output frame belongs to a stale or unbound generation".into());
-        }
-        if record.kind != MediaRecordKind::H264AccessUnit {
-            return Err("output worker accepts access units only; use Reset for Stop".into());
-        }
-        write_record(
-            self.input
-                .as_mut()
-                .ok_or("output worker media input is closed")?,
-            binding,
-            record,
-        )?;
-        std::io::Write::flush(
-            self.input
-                .as_mut()
-                .ok_or("output worker media input is closed")?,
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn shutdown(&mut self) {
-        if self.input.is_some()
-            && self.failure.is_none()
-            && let Some(input) = self.input.as_mut()
-        {
-            let _ = write_output_control(input, OutputControlCommand::Shutdown);
-            let _ = std::io::Write::flush(input);
-        }
-        self.input.take();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-impl Drop for OutputWorker {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
 pub(crate) fn require_request_id(
     expected: Option<[u8; 16]>,
     received: &str,
@@ -742,8 +658,10 @@ mod tests {
         sender.send(Ok(access_unit(1)));
         sender.send(Ok(access_unit(2)));
 
-        assert_eq!(receiver.recv().await.unwrap().unwrap().sequence, 1);
-        assert_eq!(receiver.recv().await.unwrap().unwrap().sequence, 2);
+        let first = receiver.recv().await.unwrap();
+        assert_eq!(first.result.unwrap().sequence, 1);
+        assert_eq!(first.dropped_frames_total, 1);
+        assert_eq!(receiver.recv().await.unwrap().result.unwrap().sequence, 2);
     }
 
     #[tokio::test]
@@ -760,7 +678,7 @@ mod tests {
         }));
 
         assert_eq!(
-            receiver.recv().await.unwrap().unwrap().kind,
+            receiver.recv().await.unwrap().result.unwrap().kind,
             MediaRecordKind::Stop
         );
         assert!(receiver.recv().await.is_none());

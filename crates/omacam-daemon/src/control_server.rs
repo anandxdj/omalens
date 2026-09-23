@@ -10,9 +10,8 @@ use mdns_sd::{ServiceDaemon, ServiceInfo};
 use omacam_core::SessionPolicy;
 use omacam_core::control::{ControlProof, ControlSession};
 use omacam_core::media::{ControlConnectionId, MediaBinding, MediaSessionId, PeerIdentity};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::BufReader;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, timeout};
@@ -22,9 +21,13 @@ use tokio_rustls::rustls::pki_types::PrivateKeyDer;
 
 use crate::service_runtime::{ServiceIntent, ServiceRuntime};
 use crate::{
-    CLIENT_STEP_TIMEOUT, MAX_CONTROL_MESSAGE_BYTES, capture, default_data_path, forget_trust,
-    hostname_display_name, load_or_create_identity, load_trust_record,
+    CLIENT_STEP_TIMEOUT, capture, default_data_path, forget_trust, hostname_display_name,
+    load_or_create_identity, load_trust_record,
 };
+
+#[path = "control_server/protocol.rs"]
+mod protocol;
+pub(crate) use protocol::{ControlCommand, ControlReply, read_json_line, write_json_line};
 
 #[derive(Debug)]
 pub(crate) struct ControlServeOptions {
@@ -139,7 +142,7 @@ pub(crate) async fn run_owned_control_server(
                 intent = intent_rx.recv() => {
                     let intent = intent.ok_or("service intent channel stopped")?;
                     match intent {
-                        ServiceIntent::RequestStart { operation_id } => runtime.fail(
+                        ServiceIntent::RequestStart { operation_id } | ServiceIntent::CameraControl { operation_id, .. } => runtime.fail(
                             &operation_id,
                             "peer_not_trusted",
                             "no trusted phone is available",
@@ -290,7 +293,10 @@ async fn run_control_accept_loop(
         let socket = match accepted {
             Accepted::Socket(socket) => socket,
             Accepted::OutputHealth => continue,
-            Accepted::Intent(ServiceIntent::RequestStart { operation_id }) => {
+            Accepted::Intent(
+                ServiceIntent::RequestStart { operation_id }
+                | ServiceIntent::CameraControl { operation_id, .. },
+            ) => {
                 if let Some((state, _)) = &runtime {
                     state.fail(
                         &operation_id,
@@ -374,6 +380,7 @@ async fn run_control_connection(
     mut runtime: Option<(&ServiceRuntime, &mut mpsc::Receiver<ServiceIntent>)>,
     mut output: Option<&mut capture::OutputWorker>,
 ) -> Result<ControlConnectionOutcome, Box<dyn std::error::Error>> {
+    socket.set_nodelay(true)?;
     let tls_stream = timeout(CLIENT_STEP_TIMEOUT, acceptor.accept(socket))
         .await
         .map_err(|_| "TLS handshake timed out")??;
@@ -486,6 +493,15 @@ async fn run_control_connection(
         }
         if let Next::Service(intent) = next {
             match intent {
+                ServiceIntent::CameraControl { operation_id, .. } => {
+                    if let Some((state, _)) = &runtime {
+                        state.fail(
+                            &operation_id,
+                            "capture_idle",
+                            "camera controls require active capture",
+                        );
+                    }
+                }
                 ServiceIntent::RequestStart { operation_id } => {
                     if request_id.is_some() {
                         if let Some((state, _)) = &runtime {
@@ -564,6 +580,8 @@ async fn run_control_connection(
             return Err("trusted phone was revoked while control was connected".into());
         }
         match command {
+            ControlCommand::CameraState { .. } => { /* Ignore a late acknowledgement after Stop. */
+            }
             ControlCommand::Ping => {
                 write_json_line(
                     &mut control_write,
@@ -693,156 +711,6 @@ fn advertise_control_service(
     let fullname = service.get_fullname().to_owned();
     discovery.register(service)?;
     Ok((discovery, fullname))
-}
-
-pub(crate) async fn read_json_line<
-    T: serde::de::DeserializeOwned,
-    R: tokio::io::AsyncRead + Unpin,
->(
-    reader: &mut BufReader<R>,
-) -> Result<T, Box<dyn std::error::Error>> {
-    let mut message = Vec::new();
-    let bytes_read = timeout(
-        CLIENT_STEP_TIMEOUT,
-        reader
-            .take(MAX_CONTROL_MESSAGE_BYTES + 1)
-            .read_until(b'\n', &mut message),
-    )
-    .await
-    .map_err(|_| "control message timed out")??;
-    if bytes_read == 0 || bytes_read as u64 > MAX_CONTROL_MESSAGE_BYTES {
-        return Err("control message is empty or too large".into());
-    }
-    if message.last() == Some(&b'\n') {
-        message.pop();
-    }
-    Ok(serde_json::from_slice(&message)?)
-}
-
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ControlReply {
-    Authenticated {
-        version: u8,
-        capture_authorized: bool,
-    },
-    Pong {
-        capture_authorized: bool,
-    },
-    StartRequest {
-        request_id: String,
-        desktop_name: String,
-        width: u16,
-        height: u16,
-        fps: u8,
-        codec: &'static str,
-    },
-    CaptureGranted {
-        request_id: String,
-        peer: String,
-        connection: String,
-        session: String,
-        generation: u64,
-    },
-    MediaReady,
-    Stopped {
-        reason: String,
-    },
-    StopCapture {
-        reason: &'static str,
-    },
-    Forgotten,
-}
-
-pub(crate) enum ControlCommand {
-    Ping,
-    Disconnect,
-    ForgetPeer,
-    StartApproved {
-        request_id: String,
-    },
-    StartRejected {
-        request_id: String,
-    },
-    Stop,
-    MediaOpen {
-        peer: String,
-        connection: String,
-        media_session: String,
-        generation: u64,
-    },
-}
-
-impl<'de> Deserialize<'de> for ControlCommand {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        use serde::de::Error as _;
-        let value = serde_json::Value::deserialize(deserializer)?;
-        Self::from_value(&value).map_err(D::Error::custom)
-    }
-}
-
-impl ControlCommand {
-    fn from_value(value: &serde_json::Value) -> Result<Self, &'static str> {
-        let object = value
-            .as_object()
-            .ok_or("control command must be an object")?;
-        let message_type = object
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .ok_or("control command type is missing")?;
-        let exact = |keys: &[&str]| {
-            object.len() == keys.len() && keys.iter().all(|key| object.contains_key(*key))
-        };
-        let request_id = || {
-            object
-                .get("request_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-                .ok_or("Start request identifier is missing")
-        };
-        match message_type {
-            "ping" if exact(&["type"]) => Ok(Self::Ping),
-            "disconnect" if exact(&["type"]) => Ok(Self::Disconnect),
-            "forget_peer" if exact(&["type"]) => Ok(Self::ForgetPeer),
-            "stop" if exact(&["type"]) => Ok(Self::Stop),
-            "start_approved" if exact(&["type", "request_id"]) => Ok(Self::StartApproved {
-                request_id: request_id()?,
-            }),
-            "start_rejected" if exact(&["type", "request_id"]) => Ok(Self::StartRejected {
-                request_id: request_id()?,
-            }),
-            "media_open" if exact(&["type", "peer", "connection", "session", "generation"]) => {
-                let text = |key| {
-                    object
-                        .get(key)
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                        .ok_or("media binding text field is missing")
-                };
-                Ok(Self::MediaOpen {
-                    peer: text("peer")?,
-                    connection: text("connection")?,
-                    media_session: text("session")?,
-                    generation: object
-                        .get("generation")
-                        .and_then(serde_json::Value::as_u64)
-                        .ok_or("media generation is invalid")?,
-                })
-            }
-            _ => Err("control command fields are not recognized"),
-        }
-    }
-}
-
-pub(crate) async fn write_json_line<T: Serialize, W: tokio::io::AsyncWrite + Unpin>(
-    writer: &mut W,
-    reply: &T,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut encoded = serde_json::to_vec(reply)?;
-    encoded.push(b'\n');
-    writer.write_all(&encoded).await?;
-    writer.flush().await?;
-    Ok(())
 }
 
 #[cfg(test)]
